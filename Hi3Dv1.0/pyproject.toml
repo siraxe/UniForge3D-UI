@@ -1,0 +1,86 @@
+[build-system]
+requires = [
+    "setuptools>=77.0.3",
+    "wheel",
+]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sparc3d"
+version = "0.1.0"
+description = "SPARC3D — sparse high-resolution 3D reconstruction"
+readme = "README.md"
+# Mixed component rights, including excluded sample media: do not assert a
+# blanket license expression for the whole source archive. See THIRD_PARTY_LICENSES.md.
+# NOTICE and THIRD_PARTY_LICENSES.md carry the MIT texts that TRELLIS, Pointcept
+# and O-CNN require us to redistribute; AUTHORS is the credit NOTICE points at.
+license-files = [
+    "LICENSE",
+    "NOTICE",
+    "THIRD_PARTY_LICENSES.md",
+    "AUTHORS",
+    "sparc3d/ops/flexicubes/LICENSE.txt",
+]
+requires-python = ">=3.10,<3.11"
+# Lower bounds match the one stack the released weights were verified against:
+# Python 3.10.12 / torch 2.5.0+cu124 / CUDA 12.4. Nothing else has been measured.
+# The upper bounds are the major version that stack was measured on, so an
+# unconstrained install cannot silently land two majors away -- resolving
+# transformers 5.x against weights verified on 4.46.3 is not a supported stack.
+# docker/constraints.txt narrows these to exact versions for the image.
+dependencies = [
+    "torch>=2.5.0",
+    "torchvision>=0.20.0",
+    "transformers>=4.46.0,<5",
+    "safetensors>=0.4.3",
+    "huggingface-hub>=0.28.0,<1",
+    "numpy>=1.26.0,<2",
+    "pillow>=10.3.0",
+    "trimesh>=4.4.0,<5",
+    "pyfqmr>=0.4.0",
+]
+
+[project.optional-dependencies]
+# Everything needed to actually run on a GPU. The two sparse/attention kernels are
+# pinned to the exact builds the released weights were verified against, so a
+# clone-and-install reproduces that stack; see docs/installation.md before moving
+# either. spconv ships one wheel per CUDA minor -- `spconv-cu120` covers CUDA
+# 12.0-12.5, a newer toolkit wants `spconv-cu126`, and the unsuffixed `spconv` on
+# PyPI is CPU-only. triton backs every mesh operation and arrives with the Linux
+# torch wheel, but it is named here because it is a hard runtime requirement
+# rather than an incidental transitive dependency. accelerate backs
+# enable_sequential_cpu_offload().
+inference = [
+    "spconv-cu120==2.3.6",
+    "flash-attn==2.7.4.post1",
+    "triton>=3.1.0",
+    "accelerate>=0.31.0,<2",
+]
+# Background removal for the demo scripts; not on the refine import graph.
+demo = [
+    "rembg>=2.0.57",
+]
+dev = [
+    "pytest>=8.0.0",
+    "ruff>=0.6.0",
+]
+
+[tool.ruff]
+target-version = "py310"
+extend-exclude = ["build", "extern"]
+
+[tool.ruff.lint]
+# Pinned to Ruff's documented default set so the gate does not change with the
+# installed Ruff version. Vendored ports keep upstream style otherwise.
+select = ["E4", "E7", "E9", "F"]
+
+[tool.ruff.lint.per-file-ignores]
+# Vendored FlexiCubes keeps upstream's star import of the table data.
+"sparc3d/ops/flexicubes/flexicubes.py" = ["F403", "F405"]
+
+[tool.setuptools.packages.find]
+include = ["sparc3d", "sparc3d.*"]
+
+[tool.setuptools.package-data]
+# Apache-2.0 section 4(a): redistribute the vendored FlexiCubes with its license.
+"sparc3d.ops.flexicubes" = ["LICENSE.txt"]
