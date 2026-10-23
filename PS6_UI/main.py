@@ -11,25 +11,23 @@ Feature parity with the Flet UI:
   - textured / geometry-only mode, grid, texture size, steps, seed, the
     Low VRAM switch (on by default; off runs fp32 weights + bf16 compute),
     and an optional early stop after Shape-512 (skips the 1024 upscale);
-    Run 2nd stage can later resume the 1024 upscale from that saved mesh,
-    then Show low / Show high swaps prediction_512.glb and prediction.glb
-    in place (camera and material preserved)
-  - Run Hi3D 1536 refines the same saved Shape-512 mesh with Hi3D v1.0
+    Run 2nd stage can later resume the 1024 upscale from that saved mesh
+  - Open folder fills the viewer toolbar with a "Show:" button per *.glb in
+    the folder, so any stage of a result can be viewed (camera and material
+    preserved) and used directly: Run CelloCut, Run 2nd stage and
+    Run Hi3D 1536 all operate on the displayed model
+  - Run Hi3D 1536 refines the displayed mesh with Hi3D v1.0
     (image-conditioned, geometry only); a dropdown picks the passes:
-    1-3 (out 1536), 2-3 (out 1536), 1 (out 512), 2 (out 1024) or
-    3 (out 1536). The result is saved as prediction_hi3d_<out>.glb next to
-    the preview. It runs in one-shot hi3d_worker.py so its
-    transformers/VAE unload immediately afterwards; Show low / Show high
-    then compares it with the saved Shape-512 mesh. The decode phase
-    reports per-stage progress in the log.
-  - Run CelloCut (watertight) repairs the same saved Shape-512 mesh with
-    CelloCut (constructive 512^3 UDF + graph-cut remeshing; no model
-    download). The repaired mesh REPLACES prediction_512.glb in place AND
-    regenerates its prediction_512.shape512.pt state, so Run 2nd stage and
-    Hi3D start from the fixed geometry; the untouched originals are kept
-    (prediction_512_original.glb / .shape512.pt) and the 3D view reloads
-    the repaired mesh. Show low / Show high then compares original vs
-    watertight.
+    1-3, 2-3, 1, 2 or 3. Each rung outputs its own resolution
+    (64 -> 512, 128 -> 1024, 192 -> 1536), saved as
+    <model>_hi3d_<out>.glb next to the source. It runs in one-shot
+    hi3d_worker.py so its transformers/VAE unload immediately afterwards;
+    the decode phase reports per-stage progress in the log.
+  - Run CelloCut (watertight) repairs the displayed mesh with CelloCut
+    (constructive 512^3 UDF + graph-cut remeshing; no model download),
+    saving <model>_cellocut.glb plus a regenerated <model>_cellocut
+    .shape512.pt state next to it - the source mesh is untouched, and
+    Run 2nd stage / Hi3D can continue from the repaired geometry.
 
 Generation runs in a separate worker process (worker.py in this directory) so
 Stop can hard-kill a run and this process stays lightweight (no torch import).
@@ -40,7 +38,7 @@ Run with:  .venv/Scripts/python.exe PS6_UI/main.py   (or start_ps6.bat)
 """
 
 import json
-import shutil
+import re
 import subprocess
 import sys
 import threading
@@ -89,26 +87,57 @@ def _textured_output_path(glb: Path) -> Path:
     return glb.with_name(glb.stem + "_textured.glb")
 
 
-def _high_output_path(low_glb: Path) -> Path:
-    """Shape-512 preview GLB -> the Shape-1024 GLB in the same folder."""
-    return low_glb.with_name("prediction.glb")
+def _strip_stage_suffixes(stem: str, *, cellocut: bool = True) -> str:
+    """Drop stage suffixes so derived names never chain endlessly.
+
+    ``prediction_512_cellocut_hi3d_1536`` -> ``prediction_512`` (with the
+    hi3d suffix always dropped and, when *cellocut*, the watertight marker
+    too). The ``_512``/``_1024`` resolution markers are kept; callers decide
+    whether the new stage replaces them.
+    """
+    stem = re.sub(r"_hi3d_\d+$", "", stem)
+    if cellocut and stem.endswith("_cellocut"):
+        stem = stem[: -len("_cellocut")]
+    return stem
 
 
-def _hi3d_output_path(low_glb: Path, resolution: int) -> Path:
-    """Shape-512 preview GLB -> the Hi3D result GLB in the same folder."""
-    return low_glb.with_name(f"prediction_hi3d_{resolution}.glb")
+def _stage2_output_path(glb: Path) -> Path:
+    """Any Shape-512 mesh GLB -> the Shape-1024 upscale GLB next to it.
+
+    The upscale supersedes the source's resolution marker (so
+    ``prediction_512`` -> ``prediction_1024``, never ``_512_1024``), while a
+    ``_cellocut`` marker is kept (moved to the end) so the repaired mesh's
+    upscale does not overwrite the original's:
+    ``prediction_512_cellocut`` -> ``prediction_1024_cellocut``.
+    """
+    stem = _strip_stage_suffixes(glb.stem, cellocut=False)
+    marker = ""
+    if stem.endswith("_cellocut"):
+        marker = "_cellocut"
+        stem = stem[: -len("_cellocut")]
+    if stem.endswith("_512"):
+        stem = stem[: -len("_512")] + "_1024"
+    else:
+        stem += "_1024"
+    return glb.with_name(stem + marker + ".glb")
 
 
-def _cellocut_output_path(low_glb: Path) -> Path:
-    """Shape-512 preview GLB -> CelloCut's scratch output in the same folder.
-    On success this file replaces the Shape-512 GLB itself."""
-    return low_glb.with_name("prediction_512_cellocut.glb")
+def _hi3d_output_path(glb: Path, resolution: int) -> Path:
+    """Any mesh GLB -> the Hi3D result GLB in the same folder.
+
+    Re-running Hi3D on the same source replaces its previous result instead
+    of stacking ``_hi3d_`` suffixes; a ``_cellocut`` marker is kept so the
+    refined repaired mesh stays distinguishable from the refined original.
+    """
+    stem = _strip_stage_suffixes(glb.stem, cellocut=False)
+    return glb.with_name(f"{stem}_hi3d_{resolution}.glb")
 
 
-def _cellocut_backup_path(low_glb: Path) -> Path:
-    """Shape-512 preview GLB -> backup of the unfixed mesh, written the
-    first time CelloCut replaces it."""
-    return low_glb.with_name("prediction_512_original.glb")
+def _cellocut_output_path(glb: Path) -> Path:
+    """Any mesh GLB -> the CelloCut watertight GLB next to it (re-running
+    CelloCut on a repaired mesh overwrites the previous repair)."""
+    stem = _strip_stage_suffixes(glb.stem)
+    return glb.with_name(stem + "_cellocut.glb")
 
 
 # ---------------------------------------------------------------------------
@@ -1019,11 +1048,11 @@ class MainWindow(QMainWindow):
         self.stage1_state: Path | None = None
         self.stage1_source: Path | None = None
         self.stage1_images: list[Path] | None = None
-        # Low/high comparison pair offered once both prediction_512.glb and
-        # prediction.glb exist; compare_align caches the low mesh bounds.
-        self.compare_low: Path | None = None
-        self.compare_high: Path | None = None
-        self.compare_align = None
+        # Folder whose GLB files the Show: buttons list. Set by Open folder
+        # and by every finished run; the loaded model itself lives in
+        # viewer.current_path and is what the repair/upscale/refine buttons
+        # operate on.
+        self.viewer_folder: Path | None = None
         self._pending_kind: str | None = None
         self._pending_state: Path | None = None
         self._pending_images: list[Path] | None = None
@@ -1075,15 +1104,33 @@ class MainWindow(QMainWindow):
     # -- UI construction ------------------------------------------------
     def _build_menu(self):
         m = self.menuBar().addMenu("&File")
-        act_open = QAction("Open &model...", self)
+        act_open = QAction("Open &folder...", self)
         act_open.setShortcut("Ctrl+O")
-        act_open.triggered.connect(self.on_open_model)
+        act_open.triggered.connect(self.on_open_folder)
         m.addAction(act_open)
         m.addSeparator()
         act_quit = QAction("E&xit", self)
         act_quit.setShortcut("Ctrl+Q")
         act_quit.triggered.connect(self.close)
         m.addAction(act_quit)
+
+        view = self.menuBar().addMenu("&View")
+        act_reset = QAction("Reset &view", self)
+        act_reset.setToolTip("Frame the loaded model again (F works anywhere).")
+        act_reset.triggered.connect(self.viewer_reset)
+        view.addAction(act_reset)
+        view.addSeparator()
+        self.act_backface = QAction("&Backface culling", self)
+        self.act_backface.setCheckable(True)
+        self.act_backface.setChecked(True)   # default ON (before connecting)
+        self.act_backface.setToolTip(
+            "Hide polygons that face away from the camera. A closed, "
+            "consistently oriented mesh looks unchanged, while double-sided "
+            "sheets, flipped patches and holes become see-through - use it "
+            "to spot surfaces that are not single-sided watertight.")
+        self.act_backface.toggled.connect(
+            lambda checked: self.viewer.set_backface_culling(checked))
+        view.addAction(self.act_backface)
 
     def _build_controls(self) -> QWidget:
         panel = QWidget()
@@ -1207,9 +1254,19 @@ class MainWindow(QMainWindow):
 
         run_row = QHBoxLayout()
         run_row.setContentsMargins(0, 4, 0, 0)
-        self.btn_generate = QPushButton("Generate 3D model")
+        self.btn_stop = QPushButton("Stop")
+        self.btn_stop.setFixedHeight(32)
+        self.btn_stop.setEnabled(False)
+        self.btn_stop.clicked.connect(self.on_stop)
+        self.btn_generate = QPushButton("Generate")
         self.btn_generate.setFixedHeight(32)
         self.btn_generate.clicked.connect(self.on_generate)
+        # The main action: solid green, white text; gray when disabled.
+        self.btn_generate.setStyleSheet(
+            "QPushButton { background-color: #2e7d32; color: white; "
+            "font-weight: 600; }"
+            "QPushButton:disabled { background-color: #555555; "
+            "color: #aaaaaa; }")
         self.btn_generate_texture = QPushButton("Generate Texture")
         self.btn_generate_texture.setFixedHeight(32)
         self.btn_generate_texture.setToolTip(
@@ -1217,14 +1274,11 @@ class MainWindow(QMainWindow):
             "the selected Texture size.")
         self.btn_generate_texture.setVisible(False)
         self.btn_generate_texture.clicked.connect(self.on_generate_texture)
-        self.btn_stop = QPushButton("Stop")
-        self.btn_stop.setFixedHeight(32)
-        self.btn_stop.setEnabled(False)
-        self.btn_stop.clicked.connect(self.on_stop)
-        run_row.addWidget(self.btn_generate)
+        # Swapped: Stop sits on the left, Generate on the right.
+        run_row.addWidget(self.btn_stop)
         run_row.addWidget(self.btn_generate_texture)
         run_row.addStretch(1)
-        run_row.addWidget(self.btn_stop)
+        run_row.addWidget(self.btn_generate)
         run_box = QWidget()
         run_box.setLayout(run_row)
         form.addRow(run_box)
@@ -1243,15 +1297,15 @@ class MainWindow(QMainWindow):
         self.btn_cellocut = QPushButton("Run CelloCut (watertight)")
         self.btn_cellocut.setFixedHeight(28)
         self.btn_cellocut.setToolTip(
-            "Repair the saved Shape-512 mesh with CelloCut: it rebuilds the "
+            "Repair the displayed mesh with CelloCut: it rebuilds the "
             "mesh from a 512^3 unsigned-distance volume, solves a graph-cut "
             "cell labeling, and returns a strictly watertight solid (fixes "
             "holes, self-intersections, non-manifold edges).\n"
-            "The repaired mesh REPLACES prediction_512.glb AND its "
-            "prediction_512.shape512.pt state, so both Run 2nd stage and "
-            "Hi3D continue from the fixed geometry. The originals are kept "
-            "once (prediction_512_original.glb / .shape512.pt) and the 3D "
-            "view reloads the repaired mesh.\n"
+            "The repaired mesh is saved as <model>_cellocut.glb next to the "
+            "source (which stays untouched), together with a regenerated "
+            "<model>_cellocut.shape512.pt state, so Run 2nd stage and Hi3D "
+            "can continue from the fixed geometry. The result appears as a "
+            "new Show: button.\n"
             "Needs the GPU (CelloCut wheels are installed by install.bat; "
             "no model download).")
         self.btn_cellocut.clicked.connect(self.on_run_cellocut)
@@ -1260,15 +1314,20 @@ class MainWindow(QMainWindow):
         # "Run 2nd stage" shares the CelloCut row, offset a bit to the right.
         self.btn_stage2 = QPushButton("Run 2nd stage")
         self.btn_stage2.setFixedHeight(28)
+        # Slightly green text on the default button.
+        self.btn_stage2.setStyleSheet(
+            "QPushButton { color: #2f9e57; }"
+            "QPushButton:disabled { color: #777777; }")
         self.btn_stage2.setToolTip(
-            "Continue from the last Early stop result: run the Shape-1024 "
-            "upscale from the saved Shape-512 mesh and replace the preview "
-            "GLB with the refined geometry. Generate Texture becomes "
-            "available afterwards.")
+            "Run the Shape-1024 upscale from the displayed mesh, using the "
+            "<model>.shape512.pt state saved next to it (Early stop result "
+            "or CelloCut output). Writes <model>_1024.glb (the source's "
+            "_512 marker is replaced, a _cellocut marker is kept, e.g. "
+            "prediction_512_cellocut -> prediction_1024_cellocut); "
+            "Generate Texture becomes available afterwards.")
         self.btn_stage2.clicked.connect(self.on_run_stage2)
-        cello_row.addSpacing(16)
-        cello_row.addWidget(self.btn_stage2)
         cello_row.addStretch(1)
+        cello_row.addWidget(self.btn_stage2)
         upscale_col.addLayout(cello_row)
 
         # Hi3D section header (underlined), above the experiment knobs.
@@ -1311,11 +1370,11 @@ class MainWindow(QMainWindow):
             self.hi3d_pass_combo.addItem(label, (start, resolution))
         self.hi3d_pass_combo.setCurrentIndex(4)   # default: 3 pass
         self.hi3d_pass_combo.setToolTip(
-            "Which Hi3D v1.0 passes to run on the saved Shape-512 mesh.\n"
+            "Which Hi3D v1.0 passes to run on the displayed mesh.\n"
             "Pass 1 runs at structure 64 and outputs 512, pass 2 at 128 -> "
             "1024, pass 3 at 192 -> 1536. A 'N pass' entry runs just that "
             "rung; a 'X-Y pass' entry runs rungs X through Y. Starting at "
-            "pass 2 or 3 voxelizes the saved mesh at that structure and "
+            "pass 2 or 3 voxelizes the displayed mesh at that structure and "
             "skips the earlier passes.")
         hi3d_row.addWidget(self.hi3d_pass_combo)
         hi3d_row.addStretch(1)
@@ -1357,13 +1416,16 @@ class MainWindow(QMainWindow):
         hi3d_row3.setContentsMargins(0, 0, 0, 0)
         self.btn_hi3d = QPushButton("Run Hi3D 1536")
         self.btn_hi3d.setFixedHeight(28)
+        self.btn_hi3d.setStyleSheet(
+            "QPushButton { color: #2f9e57; }"
+            "QPushButton:disabled { color: #777777; }")
         self.btn_hi3d.setToolTip(
-            "Run Hi3D v1.0 with the selected passes, conditioned on the "
-            "selected REF image (or that run's first image when no REF is "
-            "selected).\nGeometry only: writes prediction_hi3d_<output "
-            "resolution>.glb next to the Shape-512 preview. Hi3D runs in "
-            "its own process and unloads when done; the 1536 decode is "
-            "memory-intensive.")
+            "Run Hi3D v1.0 with the selected passes on the displayed mesh, "
+            "conditioned on the selected REF image (or that run's first "
+            "image; you are asked to pick one when opening a folder).\n"
+            "Geometry only: writes <model>_hi3d_<output resolution>.glb "
+            "next to the source. Hi3D runs in its own process and unloads "
+            "when done; the 1536 decode is memory-intensive.")
         self.btn_hi3d.clicked.connect(self.on_run_hi3d)
         hi3d_row3.addStretch(1)
         hi3d_row3.addWidget(self.btn_hi3d)
@@ -1385,37 +1447,28 @@ class MainWindow(QMainWindow):
         v = QVBoxLayout(panel)
         v.setContentsMargins(0, 0, 0, 0)
         bar = QHBoxLayout()
-        b_open = QPushButton("Open model...")
-        b_open.clicked.connect(self.on_open_model)
-        b_reset = QPushButton("Reset view")
-        b_reset.clicked.connect(self.viewer_reset)
+        b_open = QPushButton("Open folder")
+        b_open.setToolTip(
+            "Pick a folder; every *.glb in it gets a Show: button so any "
+            "stage of a result can be viewed and used directly.")
+        b_open.clicked.connect(self.on_open_folder)
         self.btn_folder = QPushButton("Open output folder")
-        self.btn_folder.clicked.connect(self.on_open_folder)
+        self.btn_folder.clicked.connect(self.on_open_output_folder)
         self.btn_folder.setVisible(False)
         bar.addWidget(b_open)
-        bar.addWidget(b_reset)
         bar.addWidget(self.btn_folder)
         bar.addSpacing(12)
-        self.btn_compare = QPushButton("Show low")
-        self.btn_compare.setToolTip(
-            "Swap the viewer between the saved low-resolution mesh and the "
-            "refined high-resolution mesh from this result (Shape-512 vs "
-            "Shape-1024, or Shape-512 vs Hi3D 1536), keeping the current "
-            "camera and material.")
-        self.btn_compare.setVisible(False)
-        self.btn_compare.clicked.connect(self.on_toggle_compare)
-        bar.addWidget(self.btn_compare)
-        bar.addSpacing(12)
-        self.backface_check = QCheckBox("Backface culling")
-        self.backface_check.setChecked(True)   # default ON (no listener yet)
-        self.backface_check.setToolTip(
-            "Hide polygons that face away from the camera. A closed, "
-            "consistently oriented mesh looks unchanged, while double-sided "
-            "sheets, flipped patches and holes become see-through - use it "
-            "to spot surfaces that are not single-sided watertight.")
-        self.backface_check.toggled.connect(
-            lambda checked: self.viewer.set_backface_culling(checked))
-        bar.addWidget(self.backface_check)
+        # Show: <one button per *.glb in the current model folder>. Reset view
+        # and Backface culling live in the View menu.
+        self.show_label = QLabel("Show:")
+        self.show_label.setStyleSheet("font-size: 11px;")
+        self.show_label.setVisible(False)
+        bar.addWidget(self.show_label)
+        self.show_bar = QHBoxLayout()
+        self.show_bar.setContentsMargins(4, 0, 0, 0)
+        self.show_bar.setSpacing(4)
+        bar.addLayout(self.show_bar)
+        self._show_buttons: list[QPushButton] = []
         bar.addStretch(1)
         self.row_status = QLabel("● Idle")
         self.row_status.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
@@ -1528,25 +1581,27 @@ class MainWindow(QMainWindow):
         has_images = bool(self.image_paths)
         has_texture_state = bool(
             self.texture_state and self.texture_state.is_file())
-        has_stage1_state = bool(
-            self.stage1_state and self.stage1_state.is_file())
+        # The repair/upscale/refine buttons act on whatever model is loaded.
+        loaded = self.viewer.current_path
+        has_model = bool(loaded and loaded.is_file())
+        has_state512 = has_model and _shape512_state_path(loaded).is_file()
         self.btn_generate.setEnabled(idle and has_images)
         self.btn_generate_texture.setVisible(has_texture_state)
         self.btn_generate_texture.setEnabled(idle and has_images)
         if hasattr(self, "grp_upscale"):
-            # The panel is visible from the start but stays disabled until an
-            # Early stop run has saved a Shape-512 state to continue from.
-            self.grp_upscale.setEnabled(has_stage1_state)
+            # The panel is visible from the start but stays disabled until a
+            # model is loaded to repair/upscale/refine.
+            self.grp_upscale.setEnabled(has_model)
         if hasattr(self, "btn_stage2"):
-            self.btn_stage2.setEnabled(idle)
+            self.btn_stage2.setEnabled(idle and has_state512)
         if hasattr(self, "btn_hi3d"):
-            self.btn_hi3d.setEnabled(idle)
+            self.btn_hi3d.setEnabled(idle and has_model)
         if hasattr(self, "hi3d_pass_combo"):
-            self.hi3d_pass_combo.setEnabled(idle)
+            self.hi3d_pass_combo.setEnabled(idle and has_model)
         if hasattr(self, "hi3d_fullgpu"):
-            self.hi3d_fullgpu.setEnabled(idle)
+            self.hi3d_fullgpu.setEnabled(idle and has_model)
         if hasattr(self, "btn_cellocut"):
-            self.btn_cellocut.setEnabled(idle)
+            self.btn_cellocut.setEnabled(idle and has_model)
         self.btn_stop.setEnabled(busy or refining or repairing)
         self.btn_rmbg.setEnabled(idle and has_images)
         if hasattr(self, "low_vram_check"):
@@ -1557,8 +1612,6 @@ class MainWindow(QMainWindow):
             # while it is active (and while a run is in flight).
             self.mode_combo.setEnabled(
                 idle and not self.stop_stage1_check.isChecked())
-        if hasattr(self, "btn_compare"):
-            self._update_compare_button()
         if cutting:
             activity = "Running: background removal"
         elif refining:
@@ -1582,21 +1635,62 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(
             "Ready." if activity == "Idle" else activity)
 
-    def _update_compare_button(self):
-        """Show Show low/Show high only while both comparison GLBs exist."""
-        has_pair = bool(
-            self.compare_low and self.compare_high
-            and self.compare_low.is_file() and self.compare_high.is_file())
-        self.btn_compare.setVisible(has_pair)
-        if not has_pair:
-            return
+    # -- Show buttons ------------------------------------------------------
+    def _refresh_show_buttons(self):
+        """One button per *.glb in the current model folder."""
+        folder = self.viewer_folder
+        glbs = sorted(folder.glob("*.glb")) if folder and folder.is_dir() else []
+        # Natural order: prediction_512 before prediction_1024 before
+        # prediction_hi3d_1536 etc. sorted() already does the right thing for
+        # our naming scheme.
         current = self.viewer.current_path
-        showing_low = (current is not None
-                       and current.resolve() == self.compare_low.resolve())
-        self.btn_compare.setText("Show high" if showing_low else "Show low")
-        self.btn_compare.setEnabled(
-            not self.worker.generating and not self.rmbg.running
-            and not self.hi3d.refining)
+        current_key = current.resolve() if current is not None else None
+        # Clear the old buttons.
+        while self._show_buttons:
+            btn = self._show_buttons.pop()
+            self.show_bar.removeWidget(btn)
+            btn.deleteLater()
+        self.show_label.setVisible(bool(glbs))
+        for glb in glbs:
+            btn = QPushButton(glb.stem)
+            btn.setFixedHeight(22)
+            btn.setStyleSheet("QPushButton { padding: 2px 8px; }"
+                              "QPushButton:disabled { color: #2f9e57; }")
+            btn.setToolTip(f"Show {glb.name} in the 3D view (camera kept).")
+            btn.clicked.connect(lambda _=False, p=glb: self.on_show_model(p))
+            self.show_bar.addWidget(btn)
+            self._show_buttons.append(btn)
+            # Mark the currently displayed model (its own button disables).
+            btn.setEnabled(current_key != glb.resolve())
+        self.show_bar.addStretch(1)
+
+    def on_show_model(self, path: Path):
+        """Load one of the folder's GLBs, keeping camera and material."""
+        if not path.is_file():
+            self.log(f"Model missing: {path}", "warn")
+            self._refresh_show_buttons()
+            return
+        if self.viewer.load(path, preserve_camera=True,
+                            preserve_material=True):
+            self.log(f"Showing {path.name}.", "info")
+            self._adopt_loaded_model(path)
+        else:
+            self.log(f"Could not show {path.name}.", "error")
+
+    def _adopt_loaded_model(self, path: Path):
+        """Track a freshly displayed model: folder, texture state, buttons."""
+        self.viewer_folder = path.parent
+        self.last_output = path
+        self.btn_folder.setVisible(True)
+        state = _shape_state_path(path)
+        if state.is_file():
+            self.texture_state = state
+            self.texture_source = path
+        else:
+            self.texture_state = None
+            self.texture_source = None
+        self._refresh_show_buttons()
+        self._refresh_buttons()
 
     # -- Handlers ---------------------------------------------------------
     def viewer_reset(self):
@@ -1692,9 +1786,6 @@ class MainWindow(QMainWindow):
         self.stage1_state = None
         self.stage1_source = None
         self.stage1_images = None
-        self.compare_low = None
-        self.compare_high = None
-        self.compare_align = None
         geometry_only = self.mode_combo.currentIndex() == 1
         stop_at_stage1 = self.stop_stage1_check.isChecked()
         geometry_only = geometry_only or stop_at_stage1
@@ -1731,40 +1822,59 @@ class MainWindow(QMainWindow):
         )
         self.log("Generation queued.", "info")
 
+    def _stage2_source(self) -> tuple[Path, Path] | None:
+        """Loaded model + its Shape-512 state, or None after warning."""
+        loaded = self.viewer.current_path
+        if loaded is None or not loaded.is_file():
+            QMessageBox.information(
+                self, "UniForge3D",
+                "Load or generate a model first; Run 2nd stage upscales the "
+                "displayed Shape-512 mesh.")
+            return None
+        state = _shape512_state_path(loaded)
+        if not state.is_file():
+            QMessageBox.information(
+                self, "UniForge3D",
+                f"The displayed model has no Shape-512 state next to it "
+                f"({state.name} is missing).\nRun 2nd stage needs the "
+                "mesh saved by an Early stop run (or a CelloCut result).")
+            return None
+        return loaded, state
+
+    def _stage2_images(self) -> list[Path] | None:
+        """Conditioning images: the Early stop run's images, or a picker."""
+        if self.stage1_images:
+            images = [p for p in self.stage1_images if p.exists()]
+            if images:
+                return images
+        files, _ = QFileDialog.getOpenFileNames(
+            self, "Select input image(s) for the 2nd stage",
+            str(OUTPUT_DIR if OUTPUT_DIR.is_dir() else ROOT),
+            "Images (*.png *.jpg *.jpeg *.webp *.bmp)")
+        if not files:
+            return None
+        return [Path(f) for f in files]
+
     def on_run_stage2(self):
         if self.worker.generating or self.rmbg.running or self.hi3d.refining:
             return
-        if self.stage1_state is None or not self.stage1_state.is_file():
-            QMessageBox.information(
-                self, "UniForge3D",
-                "Run a generation with Early stop enabled first; Run 2nd "
-                "stage reuses its saved Shape-512 mesh.")
+        picked = self._stage2_source()
+        if picked is None:
             self._refresh_buttons()
             return
-        if self.stage1_source is None or self.stage1_images is None:
-            QMessageBox.warning(
-                self, "UniForge3D",
-                "The Early stop result is incomplete; run that generation "
-                "again.")
+        source, state = picked
+        images = self._stage2_images()
+        if not images:
             return
-        missing = [p for p in self.stage1_images if not p.exists()]
-        if missing:
-            QMessageBox.warning(
-                self, "UniForge3D",
-                "Input images from the Early stop run are missing:\n"
-                + "\n".join(str(p) for p in missing))
-            return
-        # Keep the Shape-512 preview as prediction_512.glb and write the
-        # refined result next to it as prediction.glb for comparison.
-        output_path = _high_output_path(self.stage1_source)
+        output_path = _stage2_output_path(source)
         state_path = _shape_state_path(output_path)
         self._pending_kind = "stage2"
         self._pending_state = state_path
-        self._pending_images = list(self.stage1_images)
+        self._pending_images = list(images)
         self.btn_folder.setVisible(False)
         self._refresh_buttons()
         self.worker.start_stage2(
-            list(self.stage1_images), output_path, self.stage1_state,
+            images, output_path, state,
             seed=(None if self.seed_spin.value() < 0
                   else self.seed_spin.value()),
             grid_size=int(self.grid_combo.currentText()),
@@ -1773,8 +1883,8 @@ class MainWindow(QMainWindow):
             texture=False,
             shape_state=state_path,
         )
-        self.log("Running 2nd stage: Shape-1024 upscale from the saved "
-                 "Shape-512 mesh (stage 1 is not re-run) ...", "info")
+        self.log(f"Running 2nd stage: Shape-1024 upscale from "
+                 f"{source.name} (stage 1 is not re-run) ...", "info")
 
     def _hi3d_condition_image(self) -> Path | None:
         """Single Hi3D condition image: the REF selection when it was used.
@@ -1805,26 +1915,26 @@ class MainWindow(QMainWindow):
     def _run_hi3d(self, *, start_structure, resolution=1536):
         if self.worker.generating or self.rmbg.running or self.hi3d.refining:
             return
-        if self.stage1_state is None or not self.stage1_state.is_file():
+        loaded = self.viewer.current_path
+        if loaded is None or not loaded.is_file():
             QMessageBox.information(
                 self, "UniForge3D",
-                "Run a generation with Early stop enabled first; Hi3D 1536 "
-                "refines its saved Shape-512 mesh.")
+                "Load or generate a model first; Hi3D 1536 refines the "
+                "displayed mesh.")
             self._refresh_buttons()
             return
-        if self.stage1_source is None or not self.stage1_source.is_file():
-            QMessageBox.warning(
-                self, "UniForge3D",
-                "The Early stop GLB is missing; run that generation again.")
-            return
-        if not self.stage1_images:
-            QMessageBox.warning(
-                self, "UniForge3D",
-                "The reference image from the Early stop run is missing; "
-                "run that generation again.")
-            return
         image = self._hi3d_condition_image()
-        if image is None or not image.is_file():
+        if image is None:
+            # No images from the generating run (opened-folder workflow):
+            # ask for the reference image Hi3D conditions on.
+            file, _ = QFileDialog.getOpenFileName(
+                self, "Select the reference image for Hi3D",
+                str(OUTPUT_DIR if OUTPUT_DIR.is_dir() else ROOT),
+                "Images (*.png *.jpg *.jpeg *.webp *.bmp)")
+            if not file:
+                return
+            image = Path(file)
+        if not image.is_file():
             QMessageBox.warning(
                 self, "UniForge3D",
                 f"Reference image not found:\n{image}")
@@ -1841,7 +1951,7 @@ class MainWindow(QMainWindow):
                 "Hi3D 1536 needs the Hi3D v1.0 source and its models.\n"
                 "Run get_models.bat first.\n\nMissing:\n" + shown)
             return
-        output_path = _hi3d_output_path(self.stage1_source, resolution)
+        output_path = _hi3d_output_path(loaded, resolution)
         # The idle UniForge3D worker keeps its pipeline resident; release it
         # so Hi3D 1536 gets the full GPU. It reloads on the next generation.
         if self.worker.alive:
@@ -1854,7 +1964,7 @@ class MainWindow(QMainWindow):
         self.btn_folder.setVisible(False)
         self._refresh_buttons()
         self.hi3d.start(
-            image, self.stage1_source, output_path, resolution=resolution,
+            image, loaded, output_path, resolution=resolution,
             seed=(None if self.seed_spin.value() < 0
                   else self.seed_spin.value()),
             start_structure=start_structure,
@@ -1880,41 +1990,29 @@ class MainWindow(QMainWindow):
                           f"{skipped})")
         self.log(
             f"Running Hi3D ({passes}, output {resolution}): refining "
-            f"{self.stage1_source.name} with {image.name} "
+            f"{loaded.name} with {image.name} "
             f"({self.hi3d_steps.value()} steps/pass, voxel budget "
             f"{self.hi3d_budget.value()}%, "
             f"{'full GPU residency' if self.hi3d_fullgpu.isChecked() else 'global memory mode'}, "
             f"geometry only) ...", "info")
 
     def on_run_cellocut(self):
-        """Watertight-repair the saved Shape-512 mesh with CelloCut."""
+        """Watertight-repair the displayed mesh with CelloCut."""
         if (self.worker.generating or self.rmbg.running
                 or self.hi3d.refining or self.cellocut.running):
             return
-        if self.stage1_state is None or not self.stage1_state.is_file():
+        loaded = self.viewer.current_path
+        if loaded is None or not loaded.is_file():
             QMessageBox.information(
                 self, "UniForge3D",
-                "Run a generation with Early stop enabled first; CelloCut "
-                "repairs its saved Shape-512 mesh.")
+                "Load or generate a model first; CelloCut repairs the "
+                "displayed mesh.")
             self._refresh_buttons()
             return
-        if self.stage1_source is None or not self.stage1_source.is_file():
-            QMessageBox.warning(
-                self, "UniForge3D",
-                "The Early stop GLB is missing; run that generation again.")
-            return
-        output_path = _cellocut_output_path(self.stage1_source)
-        state_path = _shape512_state_path(self.stage1_source)
-        # Back up the original Shape-512 state once, before the worker
-        # regenerates it from the repaired mesh.
-        if state_path.is_file():
-            state_backup = state_path.with_name(
-                state_path.name.replace(".shape512.pt",
-                                        "_original.shape512.pt"))
-            if not state_backup.is_file():
-                shutil.copy2(state_path, state_backup)
-                self.log(f"Original Shape-512 state kept as "
-                         f"{state_backup.name}.", "info")
+        output_path = _cellocut_output_path(loaded)
+        # Regenerate the Run-2nd-stage checkpoint from the repaired mesh and
+        # save it next to the new GLB, so the upscale can continue from it.
+        state_path = _shape512_state_path(output_path)
         # The idle UniForge3D worker keeps its pipeline resident; release it
         # so the 512^3 UDF rasterization gets the full GPU. It reloads on the
         # next generation.
@@ -1927,56 +2025,28 @@ class MainWindow(QMainWindow):
         self._pending_images = None
         self.btn_folder.setVisible(False)
         self._refresh_buttons()
-        self.cellocut.start(self.stage1_source, output_path,
-                            shape512_state=state_path)
+        self.cellocut.start(loaded, output_path, shape512_state=state_path)
         self.log(f"Running CelloCut watertight repair on "
-                 f"{self.stage1_source.name} (512^3 UDF, graph cut, "
+                 f"{loaded.name} (512^3 UDF, graph cut, "
                  f"geometry only) ...", "info")
 
     def _on_cellocut_done(self, output: str, seed=None):
         self._clear_pending_job()
         repaired = Path(output)
-        target = self.stage1_source
-        if target is None or not target.is_file():
-            self.log("The Shape-512 GLB vanished; keeping the repaired "
-                     f"mesh as {repaired.name}.", "warn")
-            target = repaired.with_name("prediction_512.glb")
-            shutil.copy2(repaired, target)
-            repaired.unlink(missing_ok=True)
-        else:
-            # Replace the stage-1 mesh in place; keep the original once.
-            backup = _cellocut_backup_path(target)
-            if not backup.is_file():
-                shutil.copy2(target, backup)
-                self.log(f"Original mesh kept as {backup.name}.", "info")
-            shutil.copy2(repaired, target)
-            repaired.unlink(missing_ok=True)
-        self.log(f"CelloCut finished; {target.name} now holds the watertight "
-                 "mesh.", "ok")
-        self.last_output = target
+        self.log(f"CelloCut finished; saved {repaired.name} "
+                 f"(the source mesh is untouched).", "ok")
+        self.last_output = repaired
         self.btn_folder.setVisible(True)
-        # Show low / Show high compares the untouched original with the
-        # repaired mesh now stored under the Shape-512 name.
-        backup = _cellocut_backup_path(target)
-        if backup.is_file():
-            self.compare_low = backup
-            self.compare_high = target
-            self.compare_align = None
-            self.log("Show low / Show high is available "
-                     "(original vs watertight).", "ok")
-        else:
-            self.compare_low = None
-            self.compare_high = None
-            self.compare_align = None
-        if self.viewer.load(target, preserve_camera=True,
+        if self.viewer.load(repaired, preserve_camera=True,
                             preserve_material=True):
-            self.log("Reloaded the watertight mesh in the 3D view "
-                     "(camera kept).", "ok")
+            self.log("Showing the watertight mesh (camera kept).", "ok")
         else:
             self.log("Could not display the repaired mesh in viewer.",
                      "error")
+        self.viewer_folder = repaired.parent
+        self._refresh_show_buttons()
         # Publish the repaired OBJ next to the GLB, like every other run.
-        self.converter.convert(target)
+        self.converter.convert(repaired)
         self._refresh_buttons()
 
     def _on_cellocut_failed(self, msg: str):
@@ -2113,100 +2183,48 @@ class MainWindow(QMainWindow):
                  "the next run.", "warn")
         self._refresh_buttons()
 
-    def on_open_model(self):
-        start = str(OUTPUT_DIR) if OUTPUT_DIR.is_dir() else str(ROOT)
-        files, _ = QFileDialog.getOpenFileNames(
-            self, "Open 3D model(s)", start,
-            "Models (*.glb *.gltf *.obj *.stl *.ply)")
-        loaded_path: Path | None = None
-        for f in files:
-            self.log(f"Loading {f} ...", "info")
-            if self.viewer.load(f):
-                self.log(f"Loaded {Path(f).name}", "ok")
-                loaded_path = Path(f)
-            else:
-                self.log(f"Failed to load {f}", "error")
-        if loaded_path is not None:
-            self.last_output = loaded_path
-            self.btn_folder.setVisible(True)
-            # Reopening a geometry-only result restores Generate Texture if
-            # its shape-state sidecar still exists.
-            state = _shape_state_path(loaded_path)
-            if state.is_file():
-                self.texture_state = state
-                self.texture_source = loaded_path
-            else:
-                self.texture_state = None
-                self.texture_source = None
-            # Offer the low/high toggle when this folder holds a pair.
-            low_path = loaded_path.with_name("prediction_512.glb")
-            high_path = loaded_path.with_name("prediction.glb")
-            hi3d_paths = sorted(loaded_path.parent.glob(
-                "prediction_hi3d_*.glb"))
-            original_path = loaded_path.with_name(
-                "prediction_512_original.glb")
-            pair = None
-            if loaded_path.name == "prediction.glb":
-                if low_path.is_file():
-                    pair = (low_path, high_path)
-            elif loaded_path.name.startswith("prediction_hi3d_"):
-                if low_path.is_file():
-                    pair = (low_path, loaded_path)
-            elif loaded_path.name == "prediction_512.glb":
-                if original_path.is_file():
-                    # CelloCut replaced the Shape-512 mesh; compare against
-                    # the untouched original.
-                    pair = (original_path, loaded_path)
-                elif high_path.is_file():
-                    pair = (low_path, high_path)
-                elif hi3d_paths:
-                    pair = (low_path, hi3d_paths[-1])
-            elif loaded_path.name == "prediction_512_original.glb":
-                if low_path.is_file():
-                    pair = (loaded_path, low_path)
-            if pair is not None:
-                self.compare_low, self.compare_high = pair
-                self.compare_align = None
-                self.log("Show low / Show high is available for this folder.",
-                         "ok")
-            else:
-                self.compare_low = None
-                self.compare_high = None
-                self.compare_align = None
-            self._clear_pending_job()
-        self._refresh_buttons()
-
     def on_open_folder(self):
+        """Pick a folder; its GLBs become Show: buttons and one loads."""
+        start = str(self.viewer_folder or
+                    (OUTPUT_DIR if OUTPUT_DIR.is_dir() else ROOT))
+        chosen = QFileDialog.getExistingDirectory(
+            self, "Open model folder", start)
+        if not chosen:
+            return
+        folder = Path(chosen)
+        glbs = sorted(folder.glob("*.glb"))
+        if not glbs:
+            self.viewer_folder = folder
+            self._refresh_show_buttons()
+            self.log(f"No *.glb files in {folder}.", "warn")
+            self._refresh_buttons()
+            return
+        # Load a sensible default: the full-res result, then the Shape-512
+        # preview, then whatever is there.
+        names = {g.name for g in glbs}
+        first = next((n for n in ("prediction.glb", "prediction_512.glb")
+                      if n in names), glbs[0].name)
+        self.viewer_folder = folder
+        target = folder / first
+        self.log(f"Opened {folder.name} ({len(glbs)} glb file(s)); loading "
+                 f"{first} ...", "info")
+        if self.viewer.load(target):
+            self._adopt_loaded_model(target)
+            self.log(f"Loaded {first}. Use the Show: buttons to switch "
+                     "between the models in this folder.", "ok")
+        else:
+            self.log(f"Could not load {first}.", "error")
+            self._refresh_show_buttons()
+            self._refresh_buttons()
+        self._clear_pending_job()
+
+    def on_open_output_folder(self):
         """Open the folder holding the last generated model (glb/obj/...)."""
         import os
         target = (self.last_output.parent if self.last_output
                   else OUTPUT_DIR)
         if target.is_dir():
             os.startfile(str(target))
-
-    def on_toggle_compare(self):
-        """Swap low/high geometry in place, keeping camera and material."""
-        if not (self.compare_low and self.compare_high):
-            return
-        current = self.viewer.current_path
-        showing_low = (current is not None
-                       and current.resolve() == self.compare_low.resolve())
-        target = self.compare_high if showing_low else self.compare_low
-        if not target.is_file():
-            self.log(f"Comparison model missing: {target}", "warn")
-            self._update_compare_button()
-            return
-        if self.compare_align is None:
-            # Cache the coarse bounds once so both meshes toggle in place.
-            self.compare_align = viewer_mod.file_bounds(self.compare_low)
-        if self.viewer.load(target, preserve_camera=True,
-                            preserve_material=True,
-                            align_bounds=self.compare_align):
-            which = "low" if target == self.compare_low else "high"
-            self.log(f"Showing {target.name} ({which}) geometry.", "info")
-        else:
-            self.log(f"Could not show {target.name}.", "error")
-        self._update_compare_button()
 
     # -- Worker events ------------------------------------------------------
     def _on_worker_log(self, msg: str, level: str):
@@ -2231,6 +2249,7 @@ class MainWindow(QMainWindow):
                 self._update_seed_button()
         self.last_output = out
         self.btn_folder.setVisible(True)
+        self.viewer_folder = out.parent
         if kind == "stage1":
             # Early-stop output is the decoded Shape-512 mesh; it has no
             # Shape-1024 latent, so Generate Texture is unavailable.
@@ -2276,17 +2295,6 @@ class MainWindow(QMainWindow):
                 self.texture_source = None
                 self.log("2nd stage finished, but its texture state was not "
                          "saved; Generate Texture is unavailable.", "warn")
-            low = out.with_name("prediction_512.glb")
-            if out.is_file() and low.is_file():
-                self.compare_low = low
-                self.compare_high = out
-                self.compare_align = None
-                self.log("Show low / Show high is available "
-                         "(prediction_512.glb vs prediction.glb).", "ok")
-            else:
-                self.compare_low = None
-                self.compare_high = None
-                self.compare_align = None
         # kind == "texture": keep the geometry state for further re-textures.
         same_model = (
             kind == "texture"
@@ -2302,6 +2310,7 @@ class MainWindow(QMainWindow):
             self.log(f"Loaded result into viewer: {out.name}", "ok")
         else:
             self.log("Could not display result in viewer.", "error")
+        self._refresh_show_buttons()
         # automatically publish an OBJ next to the GLB
         self.converter.convert(out)
         self._refresh_buttons()
@@ -2325,29 +2334,14 @@ class MainWindow(QMainWindow):
                 self._update_seed_button()
         self.last_output = out
         self.btn_folder.setVisible(True)
-        # The Hi3D mesh is recentered/normalized, so align it to the
-        # Shape-512 bounds for the in-place low/high comparison. The saved
-        # GLB keeps Hi3D's own scale; only the viewer is aligned.
-        low = self.stage1_source
-        if low is not None and low.is_file() and low.resolve() != out.resolve():
-            self.compare_low = low
-            self.compare_high = out
-            self.compare_align = viewer_mod.file_bounds(low)
-            align = self.compare_align
-        else:
-            self.compare_low = None
-            self.compare_high = None
-            self.compare_align = None
-            align = None
+        self.viewer_folder = out.parent
         self.log("Hi3D recenters the result and normalizes it to unit "
                  "radius; absolute scale is not preserved.", "info")
-        if self.viewer.load(output, align_bounds=align):
+        if self.viewer.load(output):
             self.log(f"Loaded Hi3D result into viewer: {out.name}", "ok")
-            if self.compare_low is not None:
-                self.log("Show low / Show high is available "
-                         f"(Shape-512 vs {out.name}).", "ok")
         else:
             self.log("Could not display the Hi3D result in viewer.", "error")
+        self._refresh_show_buttons()
         # Published next to the GLB, like every other completed run.
         self.converter.convert(out)
         self._refresh_buttons()
