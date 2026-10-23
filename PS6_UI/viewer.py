@@ -11,6 +11,9 @@ right. Clicking one applies its material preset to the loaded model:
   1 current/original   2 dark + specular + slight metal
   3 bronze (metallic)  4 original texture / attached textured mesh
                           (disabled when the model has none)
+
+Backface culling (toolbar checkbox): hides polygons facing away from the
+camera, which exposes double-sided sheets, flipped patches and holes.
 """
 
 import math
@@ -91,6 +94,7 @@ class ModelViewer(QVTKRenderWindowInteractor):
         self._texture_originals = []     # material state of that variant
         self._has_textures = False
         self._preset = "original"
+        self._backface_cull = True
 
         self._build_swatches()
         self._picker = vtk.vtkPropPicker()
@@ -183,11 +187,33 @@ class ModelViewer(QVTKRenderWindowInteractor):
                              else preset)
         else:
             self._set_preset("dark_specular")   # 1st swatch = default
+        self._apply_backface_culling()   # re-apply on the freshly loaded actors
         self._fit_swatches()             # fresh camera scale for this window size
         self.render_now()
         return True
 
     # ------------------------------------------------------------------
+    def set_backface_culling(self, enabled: bool) -> None:
+        """Toggle back-face culling on the loaded model.
+
+        With culling on, polygons whose normals point away from the camera
+        are not drawn. A cleanly closed, consistently oriented mesh looks
+        unchanged (the far side's front faces still cover it), while
+        double-sided sheets, flipped patches and holes lose their back
+        faces and become see-through - an easy way to spot them.
+        """
+        self._backface_cull = bool(enabled)
+        self._apply_backface_culling()
+        self.render_now()
+
+    def _apply_backface_culling(self):
+        for actor in (*self._model_actors, *self._texture_actors):
+            prop = actor.GetProperty()
+            if self._backface_cull:
+                prop.BackfaceCullingOn()
+            else:
+                prop.BackfaceCullingOff()
+
     def _load_gltf(self, path: Path) -> bool:
         actors = self._read_gltf_actors(path)
         if not actors:
@@ -492,6 +518,7 @@ class ModelViewer(QVTKRenderWindowInteractor):
             actor.SetVisibility(False)
         self._align_actors(actors, target)
         self._has_textures = True
+        self._apply_backface_culling()
         self._refresh_textured_swatch()
         if self._preset == "textured":
             self._set_preset("textured")

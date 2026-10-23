@@ -8,6 +8,9 @@ from __future__ import annotations
 
 from typing import Sequence
 
+from torch import nn
+
+from sparc3d.ops import sparse_backend
 from sparc3d.models.autoencoders.blocks import (
     ConvOut,
     SparseAttentionBlock,
@@ -17,6 +20,14 @@ from sparc3d.models.autoencoders.blocks import (
 )
 from sparc3d.structures.point import Point
 from sparc3d.structures.point_modules import PointModule, PointSequential
+
+DECODE_PROGRESS_HOOK = None
+"""Optional callable ``(step, total, label)`` invoked before each decoder stage
+runs and once more with ``label == "activate"`` after the head. Inference-time
+decodes at 1536 run for minutes with the GPU mostly idle in bounded chunks, so
+host applications can install this to surface decode progress. Assign the
+module attribute (``ptv3.DECODE_PROGRESS_HOOK = fn``) and set it back to
+``None`` afterwards; exceptions from the hook are swallowed."""
 
 
 class PTv3MeshDecoder(PointModule):
@@ -97,6 +108,21 @@ class PTv3MeshDecoder(PointModule):
         # Eight extra output channels carry the per-corner SDF sign logits.
         self.conv_out = ConvOut(block_out, 8 + out_channels)
 
+    def _decode_stages(self) -> list[tuple[str, nn.Module]]:
+        """Flat ``(label, module)`` list of the decode pass, in execution order."""
+        stages: list[tuple[str, nn.Module]] = [("embed", self.z_to_f)]
+        stages.extend(
+            (f"mid.{name}", module)
+            for name, module in self.mid._modules.items()
+        )
+        for stage_name, dec in self.dec._modules.items():
+            stages.extend(
+                (f"{stage_name}.{name}", module)
+                for name, module in dec._modules.items()
+            )
+        stages.append(("head", self.conv_out))
+        return stages
+
     def forward(self, point: Point) -> Point:
         """Decode latents into per-corner SDF signs, distances and deformations.
 
@@ -110,9 +136,30 @@ class PTv3MeshDecoder(PointModule):
         """
         if not point.is_sparsified:
             point.sparsify()
-        point = self.z_to_f(point)
-        if not point.is_serialized:
-            point.serialization(order=self.order)
-        point = self.mid(point)
-        point = self.dec(point)
-        return self.conv_out(point)
+
+        hook = DECODE_PROGRESS_HOOK
+        stages = self._decode_stages()
+        total = len(stages)
+        for step, (label, module) in enumerate(stages, 1):
+            if hook is not None:
+                try:
+                    hook(step, total, label)
+                except Exception:  # noqa: BLE001 - progress must never kill a decode
+                    pass
+            if isinstance(module, PointModule):
+                point = module(point)
+            elif sparse_backend.is_sparse_conv(module):
+                point.sparse_conv_feat = module(point.sparse_conv_feat)
+                point.feat = sparse_backend.get_feats(point.sparse_conv_feat)
+            else:
+                point.update_feat(module(point.feat))
+            if label == "embed" and not point.is_serialized:
+                # The serialized order must exist before the attention stack.
+                point.serialization(order=self.order)
+
+        if hook is not None:
+            try:
+                hook(total, total, "activate")
+            except Exception:  # noqa: BLE001
+                pass
+        return point

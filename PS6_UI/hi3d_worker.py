@@ -83,6 +83,21 @@ def _run_refine(pipeline, cmd: dict) -> None:
     seed = _resolve_seed(cmd)
     start_structure = cmd.get("start_structure")
 
+    # Optional experiment knob from the UI: scale every rung's
+    # occupied-voxel budget. Must happen before the voxelization below and
+    # before the pipeline reads PASS_BUDGETS between passes.
+    budget_percent = int(cmd.get("budget_percent") or 100)
+    if budget_percent != 100:
+        import sparc3d.pipelines.sparc3d_pipeline as pipeline_module
+
+        budgets = pipeline_module.PASS_BUDGETS
+        pipeline_module.PASS_BUDGETS = tuple(
+            max(1, int(budget * budget_percent / 100))
+            for budget in budgets)
+        emit({"type": "log", "msg": (
+            f"Scaled occupied-voxel budgets to {budget_percent}%: "
+            f"{pipeline_module.PASS_BUDGETS} (was {budgets}).")})
+
     if not image_path.is_file():
         raise FileNotFoundError(f"reference image not found: {image_path}")
     if not coarse_path.is_file():
@@ -101,14 +116,23 @@ def _run_refine(pipeline, cmd: dict) -> None:
             raise ValueError(
                 f"start_structure must be one of {STRUCTURE_RESOLUTIONS}, "
                 f"got {start_structure}")
+        from sparc3d.pipelines.sparc3d_pipeline import OUTPUT_RESOLUTIONS
+
         start_index = STRUCTURE_RESOLUTIONS.index(start_structure)
-        mode_label = (
-            f"pass {start_index + 1}/{len(STRUCTURE_RESOLUTIONS)} only, "
-            f"structure {start_structure}")
-        if start_index > 0:
-            mode_label += " (earlier passes skipped)"
+        target_index = OUTPUT_RESOLUTIONS.index(resolution)
+        rungs = " > ".join(
+            str(s) for s in STRUCTURE_RESOLUTIONS[
+                start_index:target_index + 1])
+        skipped = ("; earlier passes skipped" if start_index > 0 else "")
+        if start_index == target_index:
+            mode_label = (f"pass {start_index + 1} only "
+                          f"(structure {start_structure}, output "
+                          f"{resolution}{skipped})")
+        else:
+            mode_label = (f"passes {start_index + 1}-{target_index + 1} "
+                          f"({rungs}, output {resolution}{skipped})")
     else:
-        mode_label = "full ladder (structures 64, 128, 192)"
+        mode_label = "full ladder (structures 64 > 128 > 192)"
 
     emit({"type": "log", "msg": (
         f"Hi3D settings: {mode_label}, resolution={resolution}, "
@@ -262,6 +286,21 @@ def main() -> int:
         return 1
 
     emit({"type": "log", "msg": "Hi3D model ready.", "level": "ok"})
+
+    # The 1536 decode runs for minutes in bounded, low-utilization chunks with
+    # no sampling steps left to report. The decoder exposes a stage hook; route
+    # it into the log so the UI keeps showing life after "step 25/25".
+    try:
+        import sparc3d.models.autoencoders.ptv3 as ptv3_module
+
+        def decode_progress(step: int, total: int, label: str) -> None:
+            emit({"type": "log",
+                  "msg": f"Hi3D decode: {label} (stage {step}/{total})"})
+
+        ptv3_module.DECODE_PROGRESS_HOOK = decode_progress
+    except Exception:  # noqa: BLE001 - progress reporting is best-effort
+        pass
+
     emit({"type": "ready"})
 
     for line in sys.stdin:

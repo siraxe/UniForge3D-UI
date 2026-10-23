@@ -14,11 +14,14 @@ Feature parity with the Flet UI:
     Run 2nd stage can later resume the 1024 upscale from that saved mesh,
     then Show low / Show high swaps prediction_512.glb and prediction.glb
     in place (camera and material preserved)
-  - Run Hi3D 1536 refines the same saved Shape-512 mesh with Hi3D v1.0 at
-    1536 resolution (image-conditioned, geometry only) and loads
-    prediction_hi3d_1536.glb next to the preview. It runs in one-shot
-    hi3d_worker.py so its transformers/VAE unload immediately afterwards;
-    Show low / Show high then compares it with the saved Shape-512 mesh.
+  - Run Hi3D 1536 refines the same saved Shape-512 mesh with Hi3D v1.0
+    (image-conditioned, geometry only); a dropdown picks the passes:
+    1-3 (out 1536), 2-3 (out 1536), 1 (out 512), 2 (out 1024) or
+    3 (out 1536). The result is saved as prediction_hi3d_<out>.glb next to
+    the preview. It runs in one-shot hi3d_worker.py so its
+    transformers/VAE unload immediately afterwards; Show low / Show high
+    then compares it with the saved Shape-512 mesh. The decode phase
+    reports per-stage progress in the log.
   - Run CelloCut (watertight) repairs the same saved Shape-512 mesh with
     CelloCut (constructive 512^3 UDF + graph-cut remeshing; no model
     download). The repaired mesh REPLACES prediction_512.glb in place AND
@@ -91,9 +94,9 @@ def _high_output_path(low_glb: Path) -> Path:
     return low_glb.with_name("prediction.glb")
 
 
-def _hi3d_output_path(low_glb: Path) -> Path:
-    """Shape-512 preview GLB -> the Hi3D 1536 GLB in the same folder."""
-    return low_glb.with_name("prediction_hi3d_1536.glb")
+def _hi3d_output_path(low_glb: Path, resolution: int) -> Path:
+    """Shape-512 preview GLB -> the Hi3D result GLB in the same folder."""
+    return low_glb.with_name(f"prediction_hi3d_{resolution}.glb")
 
 
 def _cellocut_output_path(low_glb: Path) -> Path:
@@ -547,16 +550,19 @@ class Hi3DController(QObject):
         self.low_vram = bool(enabled)
 
     def start(self, image: Path, coarse_mesh: Path, output: Path, *,
-              resolution: int = 1536, seed=None, start_structure=None):
+              resolution: int = 1536, seed=None, start_structure=None,
+              steps: int | None = None, budget_percent: int = 100,
+              low_vram: bool | None = None):
         if self._refining:
             return
         # A finished one-shot worker may still be shutting down; reap it
         # before spawning the next refinement.
         if self._proc is not None and self._proc.poll() is None:
             self.stop()
+        use_low_vram = self.low_vram if low_vram is None else low_vram
         args = [sys.executable, str(HI3D_WORKER),
                 "--model-dir", str(MODEL_DIR),
-                "--low-vram" if self.low_vram else "--no-low-vram"]
+                "--low-vram" if use_low_vram else "--no-low-vram"]
         self._proc = subprocess.Popen(
             args,
             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -581,6 +587,10 @@ class Hi3DController(QObject):
         }
         if start_structure is not None:
             cmd["start_structure"] = int(start_structure)
+        if steps is not None and int(steps) > 0:
+            cmd["steps"] = int(steps)
+        if int(budget_percent) != 100:
+            cmd["budget_percent"] = int(budget_percent)
         self._proc.stdin.write(json.dumps(cmd) + "\n")
         self._proc.stdin.flush()
         self._refining = True
@@ -1059,7 +1069,7 @@ class MainWindow(QMainWindow):
 
         splitter.addWidget(self._build_controls())
         splitter.addWidget(self._build_viewer())
-        splitter.setSizes([380, 1120])
+        splitter.setSizes([310, 1190])
         self._refresh_buttons()
 
     # -- UI construction ------------------------------------------------
@@ -1134,7 +1144,7 @@ class MainWindow(QMainWindow):
 
         self.grid_combo = QComboBox()
         self.grid_combo.addItems(["256", "384", "512", "768", "1024"])
-        self.grid_combo.setCurrentText("512")
+        self.grid_combo.setCurrentText("1024")
         form.addRow("Geometry grid", self.grid_combo)
 
         self.tex_combo = QComboBox()
@@ -1150,7 +1160,7 @@ class MainWindow(QMainWindow):
         self.steps_spin.setSpecialValueText("default")
         form.addRow("Sampler steps", self.steps_spin)
 
-        self.low_vram_check = QCheckBox("Low VRAM (recommended)")
+        self.low_vram_check = QCheckBox("Low VRAM")
         self.low_vram_check.setChecked(True)
         self.low_vram_check.setToolTip(
             "ON: keeps only the active stage's weights on the GPU and uses "
@@ -1161,9 +1171,8 @@ class MainWindow(QMainWindow):
         self.low_vram_check.toggled.connect(self._on_low_vram_toggled)
         form.addRow("Memory mode", self.low_vram_check)
 
-        self.stop_stage1_check = QCheckBox(
-            "Stop at 1st stage (skip 1024 upscale)")
-        self.stop_stage1_check.setChecked(False)
+        self.stop_stage1_check = QCheckBox("Stop at 1st stage")
+        self.stop_stage1_check.setChecked(True)
         self.stop_stage1_check.setToolTip(
             "OFF: full pipeline.\n"
             "ON: decode the Shape-512 mesh and export it after the "
@@ -1233,7 +1242,6 @@ class MainWindow(QMainWindow):
         cello_row.setContentsMargins(0, 0, 0, 0)
         self.btn_cellocut = QPushButton("Run CelloCut (watertight)")
         self.btn_cellocut.setFixedHeight(28)
-        self.btn_cellocut.setVisible(False)
         self.btn_cellocut.setToolTip(
             "Repair the saved Shape-512 mesh with CelloCut: it rebuilds the "
             "mesh from a 512^3 unsigned-distance volume, solves a graph-cut "
@@ -1248,63 +1256,119 @@ class MainWindow(QMainWindow):
             "no model download).")
         self.btn_cellocut.clicked.connect(self.on_run_cellocut)
         cello_row.addWidget(self.btn_cellocut)
-        cello_row.addStretch(1)
-        upscale_col.addLayout(cello_row)
 
-        upscale_row = QHBoxLayout()
-        upscale_row.setContentsMargins(0, 0, 0, 0)
-
+        # "Run 2nd stage" shares the CelloCut row, offset a bit to the right.
         self.btn_stage2 = QPushButton("Run 2nd stage")
         self.btn_stage2.setFixedHeight(28)
-        self.btn_stage2.setVisible(False)
         self.btn_stage2.setToolTip(
             "Continue from the last Early stop result: run the Shape-1024 "
             "upscale from the saved Shape-512 mesh and replace the preview "
             "GLB with the refined geometry. Generate Texture becomes "
             "available afterwards.")
         self.btn_stage2.clicked.connect(self.on_run_stage2)
-        upscale_row.addWidget(self.btn_stage2)
+        cello_row.addSpacing(16)
+        cello_row.addWidget(self.btn_stage2)
+        cello_row.addStretch(1)
+        upscale_col.addLayout(cello_row)
 
-        self.btn_hi3d = QPushButton("Hi3D 1536 (1-3 pass)")
+        # Hi3D section header (underlined), above the experiment knobs.
+        hi3d_header = QLabel("Hi3D (optional) :")
+        header_font = hi3d_header.font()
+        header_font.setUnderline(True)
+        hi3d_header.setFont(header_font)
+        upscale_col.addWidget(hi3d_header)
+
+        # Hi3D experiment knobs: sampling steps per pass and the
+        # occupied-voxel budget scale. Both trade quality for speed/VRAM.
+        # Row 1: steps + pass dropdown.
+        hi3d_row = QHBoxLayout()
+        hi3d_row.setContentsMargins(0, 0, 0, 0)
+        hi3d_label = QLabel("steps")
+        hi3d_row.addWidget(hi3d_label)
+        self.hi3d_steps = QSpinBox()
+        self.hi3d_steps.setRange(4, 50)
+        self.hi3d_steps.setValue(25)
+        self.hi3d_steps.setToolTip(
+            "Sampling steps per Hi3D pass (default 25, the validated "
+            "value). Fewer steps finish sampling proportionally faster "
+            "with somewhat rougher geometry; try 12-15 for quick tests.")
+        hi3d_row.addWidget(self.hi3d_steps)
+        hi3d_row.addSpacing(12)
+
+        # Hi3D pass selection: which ladder rungs to run. Each rung refines at
+        # its structure resolution and outputs its own mesh resolution
+        # (64 -> 512, 128 -> 1024, 192 -> 1536); a "N pass" entry runs just
+        # that rung, a "X-Y pass" entry runs rungs X through Y.
+        self.hi3d_pass_combo = QComboBox()
+        self.hi3d_pass_combo.setFixedHeight(28)
+        for label, start, resolution in (
+            ("1-3 pass", None, 1536),
+            ("2-3 pass", 128, 1536),
+            ("1 pass", 64, 512),
+            ("2 pass", 128, 1024),
+            ("3 pass", 192, 1536),
+        ):
+            self.hi3d_pass_combo.addItem(label, (start, resolution))
+        self.hi3d_pass_combo.setCurrentIndex(4)   # default: 3 pass
+        self.hi3d_pass_combo.setToolTip(
+            "Which Hi3D v1.0 passes to run on the saved Shape-512 mesh.\n"
+            "Pass 1 runs at structure 64 and outputs 512, pass 2 at 128 -> "
+            "1024, pass 3 at 192 -> 1536. A 'N pass' entry runs just that "
+            "rung; a 'X-Y pass' entry runs rungs X through Y. Starting at "
+            "pass 2 or 3 voxelizes the saved mesh at that structure and "
+            "skips the earlier passes.")
+        hi3d_row.addWidget(self.hi3d_pass_combo)
+        hi3d_row.addStretch(1)
+        upscale_col.addLayout(hi3d_row)
+
+        # Row 2: voxel budget + full-GPU switch + the run button.
+        hi3d_row2 = QHBoxLayout()
+        hi3d_row2.setContentsMargins(0, 0, 0, 0)
+        hi3d_label2 = QLabel("budget")
+        hi3d_row2.addWidget(hi3d_label2)
+        self.hi3d_budget = QSpinBox()
+        self.hi3d_budget.setRange(25, 100)
+        self.hi3d_budget.setValue(100)
+        self.hi3d_budget.setSuffix("%")
+        self.hi3d_budget.setToolTip(
+            "Scale for the occupied-voxel budgets of each pass (default "
+            "100% = 80k/90k/110k voxels). Fewer voxels means fewer tokens: "
+            "sampling and the memory-heavy decode both get faster and "
+            "smaller, at the cost of fine detail. The OOM retry already "
+            "drops to 65% automatically.")
+        hi3d_row2.addWidget(self.hi3d_budget)
+        hi3d_row2.addSpacing(12)
+        self.hi3d_fullgpu = QCheckBox("Full GPU")
+        self.hi3d_fullgpu.setToolTip(
+            "OFF (default): Hi3D uses sequential CPU offload when the global "
+            "Low VRAM switch is on - layers stream on/off the GPU per "
+            "forward pass, so GPU utilization looks low (10-30%) and it "
+            "runs slowly.\n"
+            "ON: keep all Hi3D weights resident on the GPU for this run - "
+            "much faster and the GPU is actually used, but the 1536 decode "
+            "peaks several GB higher and can OOM on 24-32 GB cards (it "
+            "retries once with 65% voxel budgets on OOM).")
+        hi3d_row2.addWidget(self.hi3d_fullgpu)
+        hi3d_row2.addStretch(1)
+        upscale_col.addLayout(hi3d_row2)
+
+        # Run button on its own row, aligned to the right edge.
+        hi3d_row3 = QHBoxLayout()
+        hi3d_row3.setContentsMargins(0, 0, 0, 0)
+        self.btn_hi3d = QPushButton("Run Hi3D 1536")
         self.btn_hi3d.setFixedHeight(28)
-        self.btn_hi3d.setVisible(False)
         self.btn_hi3d.setToolTip(
-            "Run the full Hi3D v1.0 ladder on the saved Shape-512 mesh: "
-            "passes 1-3 (structure 64 -> 128 -> 192, output 1536), "
-            "conditioned on the selected REF image (or that run's first "
-            "image when no REF is selected).\n"
-            "Geometry only: writes prediction_hi3d_1536.glb next to the "
-            "Shape-512 preview. Hi3D runs in its own process and unloads "
-            "when done; the final 1536 decode is memory-intensive.")
+            "Run Hi3D v1.0 with the selected passes, conditioned on the "
+            "selected REF image (or that run's first image when no REF is "
+            "selected).\nGeometry only: writes prediction_hi3d_<output "
+            "resolution>.glb next to the Shape-512 preview. Hi3D runs in "
+            "its own process and unloads when done; the 1536 decode is "
+            "memory-intensive.")
         self.btn_hi3d.clicked.connect(self.on_run_hi3d)
-        upscale_row.addWidget(self.btn_hi3d)
+        hi3d_row3.addStretch(1)
+        hi3d_row3.addWidget(self.btn_hi3d)
+        upscale_col.addLayout(hi3d_row3)
 
-        self.btn_hi3d_pass3 = QPushButton("Hi3D 1536 (3 pass only)")
-        self.btn_hi3d_pass3.setFixedHeight(28)
-        self.btn_hi3d_pass3.setVisible(False)
-        self.btn_hi3d_pass3.setToolTip(
-            "Skip Hi3D passes 1-2: voxelize the saved Shape-512 mesh at "
-            "structure 192 and run only pass 3 to 1536, using your mesh "
-            "directly.\nFaster than the full ladder, but the final 1536 "
-            "decode costs the same memory. Geometry only: writes "
-            "prediction_hi3d_1536.glb.")
-        self.btn_hi3d_pass3.clicked.connect(self.on_run_hi3d_pass3)
-        upscale_row.addWidget(self.btn_hi3d_pass3)
-        upscale_row.addStretch(1)
-
-        # Hi3D v1.0's license asks integrations to credit it with a link.
-        self.hi3d_credit = QLabel(
-            'Powered by <a href="http://hi3d.ai/">Hi3D 1.0</a>')
-        self.hi3d_credit.setTextFormat(Qt.RichText)
-        self.hi3d_credit.setOpenExternalLinks(True)
-        self.hi3d_credit.setToolTip("Hi3D v1.0 refinement (http://hi3d.ai/).")
-        self.hi3d_credit.setStyleSheet("font-size: 10px;")
-        self.hi3d_credit.setVisible(False)
-        upscale_row.addWidget(self.hi3d_credit)
-
-        upscale_col.addLayout(upscale_row)
-
-        self.grp_upscale.setVisible(False)
         layout.addWidget(self.grp_upscale)
 
         # Log ---------------------------------------------------------------
@@ -1341,6 +1405,17 @@ class MainWindow(QMainWindow):
         self.btn_compare.setVisible(False)
         self.btn_compare.clicked.connect(self.on_toggle_compare)
         bar.addWidget(self.btn_compare)
+        bar.addSpacing(12)
+        self.backface_check = QCheckBox("Backface culling")
+        self.backface_check.setChecked(True)   # default ON (no listener yet)
+        self.backface_check.setToolTip(
+            "Hide polygons that face away from the camera. A closed, "
+            "consistently oriented mesh looks unchanged, while double-sided "
+            "sheets, flipped patches and holes become see-through - use it "
+            "to spot surfaces that are not single-sided watertight.")
+        self.backface_check.toggled.connect(
+            lambda checked: self.viewer.set_backface_culling(checked))
+        bar.addWidget(self.backface_check)
         bar.addStretch(1)
         self.row_status = QLabel("● Idle")
         self.row_status.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
@@ -1459,20 +1534,19 @@ class MainWindow(QMainWindow):
         self.btn_generate_texture.setVisible(has_texture_state)
         self.btn_generate_texture.setEnabled(idle and has_images)
         if hasattr(self, "grp_upscale"):
-            self.grp_upscale.setVisible(has_stage1_state)
+            # The panel is visible from the start but stays disabled until an
+            # Early stop run has saved a Shape-512 state to continue from.
+            self.grp_upscale.setEnabled(has_stage1_state)
         if hasattr(self, "btn_stage2"):
-            self.btn_stage2.setVisible(has_stage1_state)
-            self.btn_stage2.setEnabled(idle and has_stage1_state)
+            self.btn_stage2.setEnabled(idle)
         if hasattr(self, "btn_hi3d"):
-            self.btn_hi3d.setVisible(has_stage1_state)
-            self.btn_hi3d.setEnabled(idle and has_stage1_state)
-            self.hi3d_credit.setVisible(has_stage1_state)
-        if hasattr(self, "btn_hi3d_pass3"):
-            self.btn_hi3d_pass3.setVisible(has_stage1_state)
-            self.btn_hi3d_pass3.setEnabled(idle and has_stage1_state)
+            self.btn_hi3d.setEnabled(idle)
+        if hasattr(self, "hi3d_pass_combo"):
+            self.hi3d_pass_combo.setEnabled(idle)
+        if hasattr(self, "hi3d_fullgpu"):
+            self.hi3d_fullgpu.setEnabled(idle)
         if hasattr(self, "btn_cellocut"):
-            self.btn_cellocut.setVisible(has_stage1_state)
-            self.btn_cellocut.setEnabled(idle and has_stage1_state)
+            self.btn_cellocut.setEnabled(idle)
         self.btn_stop.setEnabled(busy or refining or repairing)
         self.btn_rmbg.setEnabled(idle and has_images)
         if hasattr(self, "low_vram_check"):
@@ -1724,14 +1798,11 @@ class MainWindow(QMainWindow):
         return self.stage1_images[0]
 
     def on_run_hi3d(self):
-        """Full Hi3D v1.0 ladder (passes 1-3)."""
-        self._run_hi3d(start_structure=None)
+        """Run Hi3D v1.0 with the passes chosen in the dropdown."""
+        selection = self.hi3d_pass_combo.currentData() or (None, 1536)
+        self._run_hi3d(start_structure=selection[0], resolution=selection[1])
 
-    def on_run_hi3d_pass3(self):
-        """Hi3D pass 3 only: feed the saved mesh in at structure 192."""
-        self._run_hi3d(start_structure=192)
-
-    def _run_hi3d(self, *, start_structure):
+    def _run_hi3d(self, *, start_structure, resolution=1536):
         if self.worker.generating or self.rmbg.running or self.hi3d.refining:
             return
         if self.stage1_state is None or not self.stage1_state.is_file():
@@ -1770,7 +1841,7 @@ class MainWindow(QMainWindow):
                 "Hi3D 1536 needs the Hi3D v1.0 source and its models.\n"
                 "Run get_models.bat first.\n\nMissing:\n" + shown)
             return
-        output_path = _hi3d_output_path(self.stage1_source)
+        output_path = _hi3d_output_path(self.stage1_source, resolution)
         # The idle UniForge3D worker keeps its pipeline resident; release it
         # so Hi3D 1536 gets the full GPU. It reloads on the next generation.
         if self.worker.alive:
@@ -1783,21 +1854,37 @@ class MainWindow(QMainWindow):
         self.btn_folder.setVisible(False)
         self._refresh_buttons()
         self.hi3d.start(
-            image, self.stage1_source, output_path, resolution=1536,
+            image, self.stage1_source, output_path, resolution=resolution,
             seed=(None if self.seed_spin.value() < 0
                   else self.seed_spin.value()),
-            start_structure=start_structure)
+            start_structure=start_structure,
+            steps=self.hi3d_steps.value(),
+            budget_percent=self.hi3d_budget.value(),
+            # Full-GPU checkbox forces residency ON; unchecked follows the
+            # global Low VRAM switch instead of overriding it.
+            low_vram=(False if self.hi3d_fullgpu.isChecked() else None))
+        structures = (64, 128, 192)
         if start_structure is None:
-            self.log(
-                f"Running Hi3D 1536 (1-3 pass): refining "
-                f"{self.stage1_source.name} with {image.name} "
-                f"(25 steps, geometry only) ...", "info")
+            passes = "passes 1-3 (structures 64 > 128 > 192)"
         else:
-            self.log(
-                f"Running Hi3D 1536 (3 pass only): voxelizing "
-                f"{self.stage1_source.name} at structure {start_structure} "
-                f"and refining with {image.name} (25 steps, geometry only) "
-                f"...", "info")
+            first = structures.index(start_structure) + 1
+            last = (512, 1024, 1536).index(resolution) + 1
+            skipped = "; earlier passes skipped" if first > 1 else ""
+            if first == last:
+                passes = (f"pass {first} only (structure {start_structure}"
+                          f"{skipped})")
+            else:
+                passes = (f"passes {first}-{last} "
+                          f"(structures "
+                          f"{' > '.join(str(s) for s in structures[first - 1:last])}"
+                          f"{skipped})")
+        self.log(
+            f"Running Hi3D ({passes}, output {resolution}): refining "
+            f"{self.stage1_source.name} with {image.name} "
+            f"({self.hi3d_steps.value()} steps/pass, voxel budget "
+            f"{self.hi3d_budget.value()}%, "
+            f"{'full GPU residency' if self.hi3d_fullgpu.isChecked() else 'global memory mode'}, "
+            f"geometry only) ...", "info")
 
     def on_run_cellocut(self):
         """Watertight-repair the saved Shape-512 mesh with CelloCut."""
@@ -2054,16 +2141,17 @@ class MainWindow(QMainWindow):
             # Offer the low/high toggle when this folder holds a pair.
             low_path = loaded_path.with_name("prediction_512.glb")
             high_path = loaded_path.with_name("prediction.glb")
-            hi3d_path = loaded_path.with_name("prediction_hi3d_1536.glb")
+            hi3d_paths = sorted(loaded_path.parent.glob(
+                "prediction_hi3d_*.glb"))
             original_path = loaded_path.with_name(
                 "prediction_512_original.glb")
             pair = None
             if loaded_path.name == "prediction.glb":
                 if low_path.is_file():
                     pair = (low_path, high_path)
-            elif loaded_path.name == "prediction_hi3d_1536.glb":
+            elif loaded_path.name.startswith("prediction_hi3d_"):
                 if low_path.is_file():
-                    pair = (low_path, hi3d_path)
+                    pair = (low_path, loaded_path)
             elif loaded_path.name == "prediction_512.glb":
                 if original_path.is_file():
                     # CelloCut replaced the Shape-512 mesh; compare against
@@ -2071,8 +2159,8 @@ class MainWindow(QMainWindow):
                     pair = (original_path, loaded_path)
                 elif high_path.is_file():
                     pair = (low_path, high_path)
-                elif hi3d_path.is_file():
-                    pair = (low_path, hi3d_path)
+                elif hi3d_paths:
+                    pair = (low_path, hi3d_paths[-1])
             elif loaded_path.name == "prediction_512_original.glb":
                 if low_path.is_file():
                     pair = (loaded_path, low_path)
@@ -2227,7 +2315,7 @@ class MainWindow(QMainWindow):
     def _on_hi3d_done(self, output: str, seed=None):
         self._clear_pending_job()
         out = Path(output)
-        self.log(f"Hi3D 1536 finished -> {output}", "ok")
+        self.log(f"Hi3D finished -> {output}", "ok")
         if seed is not None:
             try:
                 self.last_seed = int(seed)
@@ -2257,7 +2345,7 @@ class MainWindow(QMainWindow):
             self.log(f"Loaded Hi3D result into viewer: {out.name}", "ok")
             if self.compare_low is not None:
                 self.log("Show low / Show high is available "
-                         "(Shape-512 vs Hi3D 1536).", "ok")
+                         f"(Shape-512 vs {out.name}).", "ok")
         else:
             self.log("Could not display the Hi3D result in viewer.", "error")
         # Published next to the GLB, like every other completed run.

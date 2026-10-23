@@ -29,16 +29,43 @@ auto-detects the model tree and applies VRAM safeguards.
 
 ### Hi3D 1536 refinement (optional)
 
-After an **Early stop** run, the **Upscale settings** panel appears below the
-UniForge3D settings. Both Hi3D buttons refine the saved `prediction_512.glb`
+The **Upscale settings** panel below the UniForge3D settings is always
+visible but stays disabled until an **Early stop** run has saved a
+Shape-512 mesh. **Run Hi3D 1536** refines the saved `prediction_512.glb`
 with Hi3D v1.0, conditioned on the image selected as **REF** (falling back to
-that run's first input image):
+that run's first input image). The dropdown next to the button picks which
+passes of the refinement ladder run:
 
-- **Hi3D 1536 (1-3 pass)** runs the full Hi3D ladder: structures 64 → 128 →
-  192, output 1536.
-- **Hi3D 1536 (3 pass only)** voxelizes your saved mesh at structure 192 and
-  runs only the final pass, skipping passes 1-2. It uses your mesh directly
-  in pass 3; the final 1536 decode has the same memory cost as the full run.
+- **1-3 pass** runs the full Hi3D ladder: structures 64 → 128 → 192, output
+  1536.
+- **2-3 pass** voxelizes your saved mesh at structure 128 and runs passes 2-3,
+  output 1536.
+- **1 pass**, **2 pass**, **3 pass** run a single rung. Each pass decodes its
+  own mesh: pass 1 outputs 512, pass 2 outputs 1024, pass 3 outputs 1536. A
+  single-pass run at 2 or 3 voxelizes your saved mesh at that structure and
+  uses it directly; the final 1536 decode has the same memory cost as the
+  full run.
+
+The result is saved as `prediction_hi3d_<output resolution>.glb`. The decode
+phase (the long silent tail after the last sampling step) reports per-stage
+progress in the log.
+
+A settings row above the button exposes three experiment knobs:
+
+- **Steps** — sampling steps per pass (default 25, the validated value).
+  Fewer steps (e.g. 12–15) sample proportionally faster with somewhat
+  rougher geometry.
+- **Voxel budget** — scale for the occupied-voxel budgets per pass (default
+  100% = 80k/90k/110k). Lower values mean fewer tokens, so sampling and the
+  memory-heavy decode both get faster and smaller at the cost of fine
+  detail. The automatic OOM retry already drops to 65%.
+- **Full GPU residency** — OFF (default) Hi3D follows the global
+  **Low VRAM** switch: with it on, layers are streamed on/off the GPU per
+  forward pass, so GPU utilization looks low and the run is slow. ON keeps
+  all Hi3D weights resident on the GPU — much faster, but the 1536 decode
+  peaks several GB higher and can OOM on 24–32 GB cards (one automatic
+  retry at 65% budgets).
+
 - **Run 2nd stage** stays in the same panel: it runs the UniForge Shape-1024
   upscale from the saved Shape-512 mesh.
 
@@ -83,6 +110,14 @@ and non-manifold edges included). Notes:
   buttons then start from the repaired geometry, and
   **Show low / Show high** compares original vs watertight.
 
+## Viewer
+
+The 3D view has **Backface culling** (toolbar checkbox, on by default):
+polygons facing away from the camera are hidden. A closed, consistently
+oriented mesh looks unchanged, while double-sided sheets, flipped patches and
+holes become see-through — useful for checking whether a result is watertight
+before running CelloCut or the refinements.
+
 ## Credits & License
 
 This is a third-party UI/packaging fork. All model and pipeline code comes from the
@@ -109,8 +144,7 @@ original **[UniForge3D](https://github.com/xibushu/UniForge3D)** repo, which bui
   the [Hi3D Open License Agreement Version 1.0](Hi3Dv1.0/LICENSE). Commercial
   use is permitted below its scale threshold (200,000 MAU / USD 1M monthly
   revenue); commercial integrations must display **Powered by Hi3D 1.0**
-  linking to [hi3d.ai](http://hi3d.ai/). The UI shows this credit next to the
-  Hi3D button.
+  linking to [hi3d.ai](http://hi3d.ai/).
 - **DINOv2-large** ([facebook/dinov2-large](https://huggingface.co/facebook/dinov2-large))
   and **CLIP ViT-L/14** ([openai/clip-vit-large-patch14](https://huggingface.co/openai/clip-vit-large-patch14)):
   third-party encoders used only by Hi3D, under their respective model licenses.
