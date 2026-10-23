@@ -1,9 +1,11 @@
 """Standalone background-removal worker (RMBG-2.0 only).
 
-Spawned by flet_UI/main.py to pre-cut imported images WITHOUT loading the
-full 3D pipeline (which pulls ~26 GB of weights into RAM). It loads just
-RMBG-2.0, processes every requested image, saves RGBA cutouts as PNG files,
-then exits -- which also frees the model's RAM automatically.
+Spawned by PS6_UI/main.py, both by the Remove background button and
+automatically by Generate for images that have no cutout yet, so it pre-cuts
+them WITHOUT loading the full 3D pipeline (which pulls ~26 GB of weights into
+RAM). It loads just RMBG-2.0, processes every requested image, saves RGBA
+cutouts as PNG files, then exits -- which also frees the model's RAM
+automatically.
 
 Images that already carry a real alpha channel are reported as processed
 without touching the model, mirroring the pipeline's own skip rule.
@@ -95,6 +97,19 @@ def main() -> int:
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    # Images that already have a real alpha channel need no model at all.
+    pending: list[Path] = []
+    for raw in args.images:
+        src = Path(raw)
+        if has_real_alpha(src):
+            emit({"type": "image", "source": str(src),
+                  "processed": str(src)})
+        else:
+            pending.append(src)
+    if not pending:
+        emit({"type": "done"})
+        return 0
+
     # Prefer the local models/ copy, fall back to the Hub.
     local = find_rmbg_dir(MODEL_DIR)
     source = str(local) if local is not None else "briaai/RMBG-2.0"
@@ -116,13 +131,8 @@ def main() -> int:
         return 1
 
     with torch.no_grad():
-        for raw in args.images:
-            src = Path(raw)
+        for src in pending:
             try:
-                if has_real_alpha(src):
-                    emit({"type": "image", "source": str(src),
-                          "processed": str(src)})
-                    continue
                 with Image.open(src) as image:
                     size = image.size
                 rgb = Image.open(src).convert("RGB")

@@ -8,7 +8,11 @@ one JSON object per line on stdio:
 
   stdin:  {"cmd": "generate", "images": [...], "output": ..., "seed": ...,
            "overwrite": ..., "grid_size": ..., "texture_size": ...,
-           "texture": true|false, "shape_state": ...}
+           "texture": true|false, "shape_state": ...,
+           "stop_at_stage1": true|false, "shape512_state": ...}
+          {"cmd": "stage2", "images": [...], "output": ..., "shape512_state": ...,
+           "shape_state": ..., "seed": ..., "overwrite": ..., "grid_size": ...,
+           "texture_size": ..., "steps": ..., "texture": true|false}
           {"cmd": "texture", "images": [...], "output": ..., "state": ...,
            "seed": ..., "overwrite": ..., "texture_size": ..., "steps": ...}
   stdout: {"type": "ready"}                       pipeline loaded, awaiting jobs
@@ -142,6 +146,11 @@ def _shape_state_path(output: str | Path) -> Path:
     return output.with_name(output.stem + ".shape_state.pt")
 
 
+def _shape512_state_path(output: str | Path) -> Path:
+    output = Path(output)
+    return output.with_name(output.stem + ".shape512.pt")
+
+
 def _resolve_seed(cmd: dict) -> int:
     """Explicit seed, or a fresh random one for the UI's 'random' option."""
     seed = cmd.get("seed")
@@ -153,6 +162,7 @@ def _run_job(pipeline, cmd: dict) -> None:
     texture_size = int(cmd["texture_size"])
     steps = int(cmd.get("steps") or 0)
     texture = bool(cmd.get("texture", True))
+    stop_at_stage1 = bool(cmd.get("stop_at_stage1", False))
     seed = _resolve_seed(cmd)
     pipeline.config["mesh_postprocess"]["grid_size"] = grid_size
     pipeline.config["texture"]["texture_size"] = texture_size
@@ -163,7 +173,20 @@ def _run_job(pipeline, cmd: dict) -> None:
             pipeline.config[stage]["sampler"]["params"]["steps"] = steps
     settings = (f"geometry output grid={grid_size}, steps={steps or 'default'}, "
                 f"seed={seed}")
-    if texture:
+    stage1_state_path: Path | None = None
+    if stop_at_stage1:
+        # The Shape-512 mesh is exported directly; no Shape-1024 latent (and
+        # thus no texture state) exists for this run. The sidecar lets Run 2nd
+        # stage resume the 1024 upscale without redoing stages 1.
+        texture = False
+        state_path = None
+        stage1_state_path = Path(cmd.get("shape512_state")
+                                 or _shape512_state_path(cmd["output"]))
+        emit({"type": "log", "msg": f"Settings: {settings}, stop after "
+                                    "Shape-512 (no 1024 upscale, no texture)"})
+        emit({"type": "log", "msg": "Running pipeline: image -> structure -> "
+                                    "shape512 -> decode (stop) ..."})
+    elif texture:
         emit({"type": "log", "msg": f"Settings: {settings}, "
                                     f"texture size={texture_size}"})
         emit({"type": "log", "msg": "Running pipeline: image -> structure -> "
@@ -181,7 +204,19 @@ def _run_job(pipeline, cmd: dict) -> None:
         overwrite=bool(cmd.get("overwrite", False)),
         texture=texture,
         save_shape_state=state_path,
+        stop_after_shape512=stop_at_stage1,
+        save_shape512_state=stage1_state_path,
     )
+    if stage1_state_path is not None:
+        if stage1_state_path.is_file():
+            emit({"type": "log", "msg": f"Shape-512 state saved; Run 2nd "
+                                        f"stage is available "
+                                        f"({stage1_state_path.name}).",
+                  "level": "ok"})
+        else:
+            emit({"type": "log", "msg": "Shape-512 state was not saved; Run "
+                                        "2nd stage is unavailable for this run.",
+                  "level": "warn"})
     if state_path is not None:
         if state_path.is_file():
             emit({"type": "log", "msg": f"Geometry saved for Generate Texture "
@@ -189,6 +224,50 @@ def _run_job(pipeline, cmd: dict) -> None:
         else:
             emit({"type": "log", "msg": "Shape state was not saved; Generate "
                                         "Texture is unavailable for this run.",
+                  "level": "warn"})
+    emit({"type": "done", "output": str(result), "seed": seed})
+
+
+def _run_stage2_job(pipeline, cmd: dict) -> None:
+    grid_size = int(cmd["grid_size"])
+    texture_size = int(cmd["texture_size"])
+    steps = int(cmd.get("steps") or 0)
+    texture = bool(cmd.get("texture", False))
+    seed = _resolve_seed(cmd)
+    pipeline.config["mesh_postprocess"]["grid_size"] = grid_size
+    pipeline.config["texture"]["texture_size"] = texture_size
+    if steps:
+        for stage in ("structured_latent_1024", "texture"):
+            pipeline.config[stage]["sampler"]["params"]["steps"] = steps
+    stage1_state = Path(cmd["shape512_state"])
+    if not stage1_state.is_file():
+        raise FileNotFoundError(
+            f"Shape-512 state not found: {stage1_state}. Run an Early stop "
+            "generation first.")
+    state_path = Path(cmd["shape_state"]) if cmd.get("shape_state") else None
+    emit({"type": "log",
+          "msg": f"2nd stage settings: geometry output grid={grid_size}, "
+                 f"steps={steps or 'default'}, seed={seed}"
+                 + (f", texture size={texture_size}" if texture else "")})
+    emit({"type": "log", "msg": "Running pipeline: shape512 state -> "
+                                "shape1024 -> "
+                                + ("texture ..." if texture else "mesh ...")})
+    result = pipeline.run_stage2(
+        [Path(p) for p in cmd["images"]],
+        cmd["output"],
+        stage1_state,
+        seed=seed,
+        overwrite=bool(cmd.get("overwrite", False)),
+        texture=texture,
+        save_shape_state=state_path,
+    )
+    if state_path is not None:
+        if state_path.is_file():
+            emit({"type": "log", "msg": "Shape-1024 state saved; Generate "
+                                        "Texture is available.", "level": "ok"})
+        else:
+            emit({"type": "log", "msg": "Shape-1024 state was not saved; "
+                                        "Generate Texture is unavailable.",
                   "level": "warn"})
     emit({"type": "done", "output": str(result), "seed": seed})
 
@@ -222,6 +301,9 @@ def main() -> int:
     parser.add_argument("--offline", action="store_true")
     args = parser.parse_args()
     model_dir = Path(args.model_dir)
+    mode = "low VRAM (fp16 weights/compute)" if args.low_vram else \
+           "full precision (fp32 weights, bf16 compute)"
+    emit({"type": "log", "msg": f"Pipeline memory mode: {mode}."})
 
     emit({"type": "log", "msg": f"Loading model from {args.model_dir} ..."
                                 + ("" if args.offline else
@@ -246,16 +328,20 @@ def main() -> int:
             emit({"type": "error", "msg": f"Bad command: {line[:200]}"})
             continue
         kind = cmd.get("cmd")
-        if kind not in ("generate", "texture"):
+        if kind not in ("generate", "texture", "stage2"):
             emit({"type": "error", "msg": f"Unknown command: {kind!r}"})
             continue
         try:
             if kind == "texture":
                 _run_texture_job(pipeline, cmd)
+            elif kind == "stage2":
+                _run_stage2_job(pipeline, cmd)
             else:
                 _run_job(pipeline, cmd)
         except Exception as ex:  # keep the loaded model for a retry
-            message = f"Generation failed: {ex}"
+            label = {"stage2": "2nd stage",
+                     "texture": "Texture generation"}.get(kind, "Generation")
+            message = f"{label} failed: {ex}"
             if ("out of memory" in message.lower()
                     and "lower Geometry" not in message):
                 message += (" Close other GPU applications, or lower Geometry output "

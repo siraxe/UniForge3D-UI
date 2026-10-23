@@ -6,8 +6,14 @@ VTK 3D viewer (GLB/OBJ/STL/PLY with PBR materials) on the right.
 Feature parity with the Flet UI:
   - imported-image thumbnails with per-image remove buttons
   - pre-generation background removal (RMBG-2.0 in a light worker process),
-    with the resulting RGBA cutouts shown as thumbnails of their own
-  - textured / geometry-only mode, grid, texture size, steps, seed
+    with the resulting RGBA cutouts shown as thumbnails of their own; Generate
+    runs this automatically for any image that has no cutout yet
+  - textured / geometry-only mode, grid, texture size, steps, seed, the
+    Low VRAM switch (on by default; off runs fp32 weights + bf16 compute),
+    and an optional early stop after Shape-512 (skips the 1024 upscale);
+    Run 2nd stage can later resume the 1024 upscale from that saved mesh,
+    then Show low / Show high swaps prediction_512.glb and prediction.glb
+    in place (camera and material preserved)
 
 Generation runs in a separate worker process (worker.py in this directory) so
 Stop can hard-kill a run and this process stays lightweight (no torch import).
@@ -23,13 +29,14 @@ import sys
 import threading
 import time
 from pathlib import Path
+from typing import Callable
 
 from PySide6.QtCore import (
     QEvent, QObject, QPoint, QSize, Qt, QThread, QTimer, Signal,
 )
 from PySide6.QtGui import QAction, QColor, QPalette, QPixmap
 from PySide6.QtWidgets import (
-    QComboBox, QFileDialog, QFormLayout,
+    QCheckBox, QComboBox, QFileDialog, QFormLayout,
     QGridLayout, QGroupBox, QHBoxLayout, QLabel, QListWidget,
     QListWidgetItem, QMainWindow, QMessageBox, QPlainTextEdit, QPushButton,
     QSpinBox, QSplitter, QToolButton, QVBoxLayout, QWidget,
@@ -53,9 +60,19 @@ def _shape_state_path(glb: Path) -> Path:
     return glb.with_name(glb.stem + ".shape_state.pt")
 
 
+def _shape512_state_path(glb: Path) -> Path:
+    """Early-stop GLB -> the Shape-512 mesh saved next to it."""
+    return glb.with_name(glb.stem + ".shape512.pt")
+
+
 def _textured_output_path(glb: Path) -> Path:
     """Geometry-only GLB -> the textured GLB generated from it."""
     return glb.with_name(glb.stem + "_textured.glb")
+
+
+def _high_output_path(low_glb: Path) -> Path:
+    """Shape-512 preview GLB -> the Shape-1024 GLB in the same folder."""
+    return low_glb.with_name("prediction.glb")
 
 
 # ---------------------------------------------------------------------------
@@ -309,6 +326,10 @@ class WorkerController(QObject):
         self._proc: subprocess.Popen | None = None
         self._reader: _WorkerReader | None = None
         self._generating = False
+        self.low_vram = True
+        # Memory mode the live worker was started with. The worker loads the
+        # pipeline once, so changing the checkbox has to restart it.
+        self._spawned_low_vram: bool | None = None
 
     @property
     def generating(self) -> bool:
@@ -318,12 +339,20 @@ class WorkerController(QObject):
     def alive(self) -> bool:
         return self._proc is not None and self._proc.poll() is None
 
+    def set_low_vram(self, enabled: bool) -> None:
+        self.low_vram = bool(enabled)
+
     def _spawn(self):
         if self._proc and self._proc.poll() is None:
-            return
+            if self._spawned_low_vram == self.low_vram:
+                return
+            # Idle worker from the other memory mode: reload before this job.
+            self.stop()
+        args = [sys.executable, str(WORKER), "--model-dir", str(MODEL_DIR),
+                "--low-vram" if self.low_vram else "--no-low-vram"]
+        self._spawned_low_vram = self.low_vram
         self._proc = subprocess.Popen(
-            [sys.executable, str(WORKER),
-             "--model-dir", str(MODEL_DIR), "--low-vram"],
+            args,
             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             text=True, encoding="utf-8", bufsize=1, cwd=str(ROOT),
         )
@@ -343,11 +372,32 @@ class WorkerController(QObject):
 
     def start_run(self, images, output: Path, *, seed, grid_size: int,
                   texture_size: int, steps: int, texture: bool,
-                  shape_state: Path | None = None):
+                  shape_state: Path | None = None,
+                  stop_at_stage1: bool = False):
         cmd = {
             "cmd": "generate",
             "images": [str(p) for p in images],
             "output": str(output),
+            "seed": seed,
+            "overwrite": True,
+            "grid_size": grid_size,
+            "texture_size": texture_size,
+            "steps": steps,
+            "texture": texture,
+            "stop_at_stage1": stop_at_stage1,
+        }
+        if shape_state is not None:
+            cmd["shape_state"] = str(shape_state)
+        self._send(cmd)
+
+    def start_stage2(self, images, output: Path, shape512_state: Path, *,
+                     seed, grid_size: int, texture_size: int, steps: int,
+                     texture: bool = False, shape_state: Path | None = None):
+        cmd = {
+            "cmd": "stage2",
+            "images": [str(p) for p in images],
+            "output": str(output),
+            "shape512_state": str(shape512_state),
             "seed": seed,
             "overwrite": True,
             "grid_size": grid_size,
@@ -389,6 +439,7 @@ class WorkerController(QObject):
                 proc.kill()
         self._reap_reader()
         self._generating = False
+        self._spawned_low_vram = None
         self.state_changed.emit(False)
 
     def _reap_reader(self):
@@ -412,6 +463,7 @@ class WorkerController(QObject):
 
     def _on_dead(self, code: int):
         self._proc = None
+        self._spawned_low_vram = None
         if self._generating:
             self._generating = False
             self.state_changed.emit(False)
@@ -605,8 +657,21 @@ class MainWindow(QMainWindow):
         # Texture reuses it, so the mesh is not regenerated.
         self.texture_state: Path | None = None
         self.texture_source: Path | None = None
+        # Early-stop runs save the Shape-512 mesh next to the GLB; Run 2nd
+        # stage reuses it to do the 1024 upscale without redoing stage 1.
+        self.stage1_state: Path | None = None
+        self.stage1_source: Path | None = None
+        self.stage1_images: list[Path] | None = None
+        # Low/high comparison pair offered once both prediction_512.glb and
+        # prediction.glb exist; compare_align caches the low mesh bounds.
+        self.compare_low: Path | None = None
+        self.compare_high: Path | None = None
+        self.compare_align = None
         self._pending_kind: str | None = None
         self._pending_state: Path | None = None
+        self._pending_images: list[Path] | None = None
+        # Set while Generate waits for automatic background cutouts.
+        self._after_rmbg: Callable[[], None] | None = None
         # Input image the user clicked as the REF selection. There is
         # deliberately no default: the user must pick one.
         self.ref_reference: Path | None = None
@@ -726,6 +791,30 @@ class MainWindow(QMainWindow):
         self.steps_spin.setSpecialValueText("default")
         form.addRow("Sampler steps", self.steps_spin)
 
+        self.low_vram_check = QCheckBox("Low VRAM (recommended)")
+        self.low_vram_check.setChecked(True)
+        self.low_vram_check.setToolTip(
+            "ON: keeps only the active stage's weights on the GPU and uses "
+            "fp16 weights/compute. Fits smaller cards.\n"
+            "OFF: fp32 weights with bf16 compute, closer to the upstream "
+            "pipeline; needs substantially more GPU memory. The worker "
+            "reloads when this changes.")
+        self.low_vram_check.toggled.connect(self._on_low_vram_toggled)
+        form.addRow("Memory mode", self.low_vram_check)
+
+        self.stop_stage1_check = QCheckBox(
+            "Stop at 1st stage (skip 1024 upscale)")
+        self.stop_stage1_check.setChecked(False)
+        self.stop_stage1_check.setToolTip(
+            "OFF: full pipeline.\n"
+            "ON: decode the Shape-512 mesh and export it after the "
+            "sparse-structure stage, skipping the Shape-1024 upscale and "
+            "texture stages. Faster; useful for checking the first geometry "
+            "pass. Texture state is not saved in this mode.")
+        self._stop_stage1_previous_mode = self.mode_combo.currentIndex()
+        self.stop_stage1_check.toggled.connect(self._on_stop_stage1_toggled)
+        form.addRow("Early stop", self.stop_stage1_check)
+
         self.seed_spin = QSpinBox()
         self.seed_spin.setRange(-1, 2_147_483_647)
         self.seed_spin.setValue(-1)
@@ -771,6 +860,24 @@ class MainWindow(QMainWindow):
         run_box = QWidget()
         run_box.setLayout(run_row)
         form.addRow(run_box)
+
+        # Appears only after an Early stop run saved a Shape-512 sidecar.
+        stage2_row = QHBoxLayout()
+        stage2_row.setContentsMargins(0, 0, 0, 0)
+        self.btn_stage2 = QPushButton("Run 2nd stage")
+        self.btn_stage2.setFixedHeight(28)
+        self.btn_stage2.setVisible(False)
+        self.btn_stage2.setToolTip(
+            "Continue from the last Early stop result: run the Shape-1024 "
+            "upscale from the saved Shape-512 mesh and replace the preview "
+            "GLB with the refined geometry. Generate Texture becomes "
+            "available afterwards.")
+        self.btn_stage2.clicked.connect(self.on_run_stage2)
+        stage2_row.addWidget(self.btn_stage2)
+        stage2_row.addStretch(1)
+        stage2_box = QWidget()
+        stage2_box.setLayout(stage2_row)
+        form.addRow(stage2_box)
         layout.addWidget(grp_set)
 
         # Log ---------------------------------------------------------------
@@ -797,6 +904,15 @@ class MainWindow(QMainWindow):
         bar.addWidget(b_open)
         bar.addWidget(b_reset)
         bar.addWidget(self.btn_folder)
+        bar.addSpacing(12)
+        self.btn_compare = QPushButton("Show low")
+        self.btn_compare.setToolTip(
+            "Swap the viewer between prediction_512.glb (low) and "
+            "prediction.glb (high) from this result, keeping the current "
+            "camera and material.")
+        self.btn_compare.setVisible(False)
+        self.btn_compare.clicked.connect(self.on_toggle_compare)
+        bar.addWidget(self.btn_compare)
         bar.addStretch(1)
         self.row_status = QLabel("● Idle")
         self.row_status.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
@@ -891,6 +1007,14 @@ class MainWindow(QMainWindow):
             self.log(f"Background removal finished ({ready}/"
                      f"{len(self.image_paths)} ready); RMBG-2.0 unloaded.", "ok")
         self._refresh_buttons()
+        # A Generate click that found images without cutouts waits here; the
+        # pipeline can still remove any that failed, so continue regardless.
+        start, self._after_rmbg = self._after_rmbg, None
+        if start is not None:
+            if code != 0:
+                self.log("Continuing with generation; the pipeline will "
+                         "remove backgrounds for any missing cutouts.", "warn")
+            start()
 
     def _refresh_buttons(self):
         busy = self.worker.generating
@@ -899,17 +1023,35 @@ class MainWindow(QMainWindow):
         has_images = bool(self.image_paths)
         has_texture_state = bool(
             self.texture_state and self.texture_state.is_file())
+        has_stage1_state = bool(
+            self.stage1_state and self.stage1_state.is_file())
         self.btn_generate.setEnabled(idle and has_images)
         self.btn_generate_texture.setVisible(has_texture_state)
         self.btn_generate_texture.setEnabled(idle and has_images)
+        if hasattr(self, "btn_stage2"):
+            self.btn_stage2.setVisible(has_stage1_state)
+            self.btn_stage2.setEnabled(idle and has_stage1_state)
         self.btn_stop.setEnabled(busy)
         self.btn_rmbg.setEnabled(idle and has_images)
+        if hasattr(self, "low_vram_check"):
+            self.low_vram_check.setEnabled(idle)
+        if hasattr(self, "stop_stage1_check"):
+            self.stop_stage1_check.setEnabled(idle)
+            # Early stop implies geometry-only output; keep the mode pinned
+            # while it is active (and while a run is in flight).
+            self.mode_combo.setEnabled(
+                idle and not self.stop_stage1_check.isChecked())
+        if hasattr(self, "btn_compare"):
+            self._update_compare_button()
         if cutting:
             activity = "Running: background removal"
         elif busy:
-            activity = ("Running: texture generation"
-                        if self._pending_kind == "texture"
-                        else "Running: UniForge3D generation")
+            if self._pending_kind == "texture":
+                activity = "Running: texture generation"
+            elif self._pending_kind == "stage2":
+                activity = "Running: 2nd stage (1024 upscale)"
+            else:
+                activity = "Running: UniForge3D generation"
         else:
             activity = "Idle"
         if hasattr(self, "row_status"):
@@ -919,6 +1061,21 @@ class MainWindow(QMainWindow):
                 f"color: {color}; font-size: 11px;")
         self.statusBar().showMessage(
             "Ready." if activity == "Idle" else activity)
+
+    def _update_compare_button(self):
+        """Show Show low/Show high only while both comparison GLBs exist."""
+        has_pair = bool(
+            self.compare_low and self.compare_high
+            and self.compare_low.is_file() and self.compare_high.is_file())
+        self.btn_compare.setVisible(has_pair)
+        if not has_pair:
+            return
+        current = self.viewer.current_path
+        showing_low = (current is not None
+                       and current.resolve() == self.compare_low.resolve())
+        self.btn_compare.setText("Show high" if showing_low else "Show low")
+        self.btn_compare.setEnabled(
+            not self.worker.generating and not self.rmbg.running)
 
     # -- Handlers ---------------------------------------------------------
     def viewer_reset(self):
@@ -940,6 +1097,9 @@ class MainWindow(QMainWindow):
             self._rebuild_thumbs()
 
     def on_clear_images(self):
+        if self._after_rmbg is not None:
+            self._after_rmbg = None
+            self.log("Pending generation cancelled (images cleared).", "warn")
         self.image_paths.clear()
         self.cutout_map.clear()
         self.ref_reference = None
@@ -959,6 +1119,32 @@ class MainWindow(QMainWindow):
         self._refresh_buttons()
         self.rmbg.start(todo)
 
+    def _queue_after_cutouts(self, sources: list[Path],
+                             start: Callable[[], None]) -> None:
+        """Run RMBG for missing cutouts, then invoke *start*.
+
+        The pipeline removes backgrounds internally for inputs without alpha,
+        but those results never reach the UI. Doing the pass here first makes
+        the automatic cutouts visible, exactly like pressing Remove background
+        manually, and lets the pipeline skip RMBG-2.0 afterwards.
+        """
+        todo = [p for p in sources if p not in self.cutout_map]
+        if not todo:
+            start()
+            return
+        self.log(f"Removing backgrounds for {len(todo)} image(s) before "
+                 "generation ...")
+        self._after_rmbg = start
+        self._refresh_buttons()
+        try:
+            self.rmbg.start(todo)
+        except Exception as ex:  # keep generation possible if RMBG cannot start
+            self._after_rmbg = None
+            self.log(f"Background removal could not start: {ex}", "error")
+            self.log("Starting generation; the pipeline will remove "
+                     "backgrounds internally.", "warn")
+            start()
+
     def on_generate(self):
         if self.worker.generating or self.rmbg.running:
             return
@@ -966,25 +1152,49 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "UniForge3D",
                                     "Add an input image first.")
             return
-        # Swap in pre-made RGBA cutouts so the pipeline skips RMBG-2.0.
         sources = list(self.image_paths)
+        self._queue_after_cutouts(
+            sources, lambda: self._start_generate(sources))
+
+    def _start_generate(self, sources: list[Path]):
+        sources = [p for p in sources if p in self.image_paths]
+        if not sources:
+            self.log("No input images left; generation cancelled.", "warn")
+            return
+        # Swap in pre-made RGBA cutouts so the pipeline skips RMBG-2.0.
         images = [self.cutout_map.get(p, p) for p in sources]
         ready = sum(1 for p in sources if p in self.cutout_map)
         if ready:
             self.log(f"Using pre-removed backgrounds for {ready}/{len(sources)}"
                      " image(s) - RMBG-2.0 will be skipped for them.")
+        # A new generation supersedes any earlier Shape-512 preview.
+        self.stage1_state = None
+        self.stage1_source = None
+        self.stage1_images = None
+        self.compare_low = None
+        self.compare_high = None
+        self.compare_align = None
+        geometry_only = self.mode_combo.currentIndex() == 1
+        stop_at_stage1 = self.stop_stage1_check.isChecked()
+        geometry_only = geometry_only or stop_at_stage1
         # One fresh folder per run: <stem>_<timestamp>, _2, _3, ... on clash.
         base_name = sources[0].stem + "_" + time.strftime("%Y%m%d_%H%M%S")
         out_dir = OUTPUT_DIR / base_name
+        output_name = ("prediction_512.glb" if stop_at_stage1
+                       else "prediction.glb")
         suffix = 2
-        while (out_dir / "prediction.glb").exists():
+        while any((out_dir / name).exists()
+                  for name in ("prediction.glb", "prediction_512.glb")):
             out_dir = OUTPUT_DIR / f"{base_name}_{suffix}"
             suffix += 1
-        geometry_only = self.mode_combo.currentIndex() == 1
-        output_path = out_dir / "prediction.glb"
-        state_path = _shape_state_path(output_path) if geometry_only else None
-        self._pending_kind = "geometry" if geometry_only else "textured"
+        output_path = out_dir / output_name
+        # Early stop has no Shape-1024 latent, so there is no texture state.
+        state_path = (_shape_state_path(output_path)
+                      if geometry_only and not stop_at_stage1 else None)
+        self._pending_kind = ("stage1" if stop_at_stage1 else
+                              "geometry" if geometry_only else "textured")
         self._pending_state = state_path
+        self._pending_images = list(images)
         self.btn_folder.setVisible(False)
         self._refresh_buttons()
         self.worker.start_run(
@@ -996,8 +1206,54 @@ class MainWindow(QMainWindow):
             steps=self.steps_spin.value(),
             texture=not geometry_only,
             shape_state=state_path,
+            stop_at_stage1=stop_at_stage1,
         )
         self.log("Generation queued.", "info")
+
+    def on_run_stage2(self):
+        if self.worker.generating or self.rmbg.running:
+            return
+        if self.stage1_state is None or not self.stage1_state.is_file():
+            QMessageBox.information(
+                self, "UniForge3D",
+                "Run a generation with Early stop enabled first; Run 2nd "
+                "stage reuses its saved Shape-512 mesh.")
+            self._refresh_buttons()
+            return
+        if self.stage1_source is None or self.stage1_images is None:
+            QMessageBox.warning(
+                self, "UniForge3D",
+                "The Early stop result is incomplete; run that generation "
+                "again.")
+            return
+        missing = [p for p in self.stage1_images if not p.exists()]
+        if missing:
+            QMessageBox.warning(
+                self, "UniForge3D",
+                "Input images from the Early stop run are missing:\n"
+                + "\n".join(str(p) for p in missing))
+            return
+        # Keep the Shape-512 preview as prediction_512.glb and write the
+        # refined result next to it as prediction.glb for comparison.
+        output_path = _high_output_path(self.stage1_source)
+        state_path = _shape_state_path(output_path)
+        self._pending_kind = "stage2"
+        self._pending_state = state_path
+        self._pending_images = list(self.stage1_images)
+        self.btn_folder.setVisible(False)
+        self._refresh_buttons()
+        self.worker.start_stage2(
+            list(self.stage1_images), output_path, self.stage1_state,
+            seed=(None if self.seed_spin.value() < 0
+                  else self.seed_spin.value()),
+            grid_size=int(self.grid_combo.currentText()),
+            texture_size=int(self.tex_combo.currentText()),
+            steps=self.steps_spin.value(),
+            texture=False,
+            shape_state=state_path,
+        )
+        self.log("Running 2nd stage: Shape-1024 upscale from the saved "
+                 "Shape-512 mesh (stage 1 is not re-run) ...", "info")
 
     def on_generate_texture(self):
         if self.worker.generating or self.rmbg.running:
@@ -1017,8 +1273,17 @@ class MainWindow(QMainWindow):
                 self, "UniForge3D",
                 "Add the input images used for the geometry pass.")
             return
-        # Swap in pre-made RGBA cutouts, exactly like on_generate.
         sources = list(self.image_paths)
+        self._queue_after_cutouts(
+            sources, lambda: self._start_generate_texture(sources))
+
+    def _start_generate_texture(self, sources: list[Path]):
+        sources = [p for p in sources if p in self.image_paths]
+        if not sources:
+            self.log("No input images left; texture generation cancelled.",
+                     "warn")
+            return
+        # Swap in pre-made RGBA cutouts, exactly like _start_generate.
         images = [self.cutout_map.get(p, p) for p in sources]
         output_path = _textured_output_path(self.texture_source)
         self._pending_kind = "texture"
@@ -1047,6 +1312,33 @@ class MainWindow(QMainWindow):
             self.seed_spin.setValue(-1)
             self.log("Seed reset to random.", "info")
 
+    def _on_low_vram_toggled(self, checked: bool):
+        self.worker.set_low_vram(checked)
+        message = (
+            "Low VRAM enabled: only the active stage stays on the GPU."
+            if checked else
+            "Low VRAM disabled: full-precision weights; needs substantially "
+            "more GPU memory.")
+        if self.worker.alive and not self.worker.generating:
+            self.worker.stop()
+            message += " Worker will reload on the next run."
+        self.log(message, "info")
+
+    def _on_stop_stage1_toggled(self, checked: bool):
+        if checked:
+            # A Shape-512-only export cannot be textured, so force the
+            # geometry-only output mode while early stop is active.
+            self._stop_stage1_previous_mode = self.mode_combo.currentIndex()
+            self.mode_combo.setCurrentIndex(1)
+            self.log("Stop at 1st stage enabled: Shape-512 mesh will be "
+                     "decoded directly; Shape-1024 and texture are skipped.",
+                     "info")
+        else:
+            self.mode_combo.setCurrentIndex(self._stop_stage1_previous_mode)
+            self.log("Stop at 1st stage disabled: the full pipeline will "
+                     "run.", "info")
+        self._refresh_buttons()
+
     def _update_seed_button(self, *_):
         if not hasattr(self, "btn_seed"):
             return
@@ -1065,6 +1357,7 @@ class MainWindow(QMainWindow):
     def _clear_pending_job(self):
         self._pending_kind = None
         self._pending_state = None
+        self._pending_images = None
 
     def on_stop(self):
         if not self.worker.generating:
@@ -1100,6 +1393,20 @@ class MainWindow(QMainWindow):
             else:
                 self.texture_state = None
                 self.texture_source = None
+            # Offer the low/high toggle when this folder holds both GLBs.
+            high_path = loaded_path.with_name("prediction.glb")
+            low_path = loaded_path.with_name("prediction_512.glb")
+            if (loaded_path.name in ("prediction.glb", "prediction_512.glb")
+                    and high_path.is_file() and low_path.is_file()):
+                self.compare_low = low_path
+                self.compare_high = high_path
+                self.compare_align = None
+                self.log("Show low / Show high is available for this folder.",
+                         "ok")
+            else:
+                self.compare_low = None
+                self.compare_high = None
+                self.compare_align = None
             self._clear_pending_job()
         self._refresh_buttons()
 
@@ -1110,6 +1417,31 @@ class MainWindow(QMainWindow):
                   else OUTPUT_DIR)
         if target.is_dir():
             os.startfile(str(target))
+
+    def on_toggle_compare(self):
+        """Swap low/high geometry in place, keeping camera and material."""
+        if not (self.compare_low and self.compare_high):
+            return
+        current = self.viewer.current_path
+        showing_low = (current is not None
+                       and current.resolve() == self.compare_low.resolve())
+        target = self.compare_high if showing_low else self.compare_low
+        if not target.is_file():
+            self.log(f"Comparison model missing: {target}", "warn")
+            self._update_compare_button()
+            return
+        if self.compare_align is None:
+            # Cache the coarse bounds once so both meshes toggle in place.
+            self.compare_align = viewer_mod.file_bounds(self.compare_low)
+        if self.viewer.load(target, preserve_camera=True,
+                            preserve_material=True,
+                            align_bounds=self.compare_align):
+            which = ("Shape-512 (low)" if target == self.compare_low
+                     else "Shape-1024 (high)")
+            self.log(f"Showing {which} geometry.", "info")
+        else:
+            self.log(f"Could not show {target.name}.", "error")
+        self._update_compare_button()
 
     # -- Worker events ------------------------------------------------------
     def _on_worker_log(self, msg: str, level: str):
@@ -1123,6 +1455,7 @@ class MainWindow(QMainWindow):
         out = Path(output)
         kind = self._pending_kind
         pending_state = self._pending_state
+        pending_images = self._pending_images
         self._clear_pending_job()
         if seed is not None:
             try:
@@ -1133,7 +1466,27 @@ class MainWindow(QMainWindow):
                 self._update_seed_button()
         self.last_output = out
         self.btn_folder.setVisible(True)
-        if kind == "geometry":
+        if kind == "stage1":
+            # Early-stop output is the decoded Shape-512 mesh; it has no
+            # Shape-1024 latent, so Generate Texture is unavailable.
+            self.texture_state = None
+            self.texture_source = None
+            self.log(f"Shape-512 preview finished ({out.name}); 1024 upscale "
+                     "and texture were skipped.", "info")
+            stage1_state = _shape512_state_path(out)
+            if stage1_state.is_file() and pending_images:
+                self.stage1_state = stage1_state
+                self.stage1_source = out
+                self.stage1_images = list(pending_images)
+                self.log("Run 2nd stage is available; it will upscale this "
+                         "Shape-512 mesh with Shape-1024.", "ok")
+            else:
+                self.stage1_state = None
+                self.stage1_source = None
+                self.stage1_images = None
+                self.log("The Shape-512 state was not saved; Run 2nd stage "
+                         "is unavailable.", "warn")
+        elif kind == "geometry":
             if pending_state is not None and pending_state.is_file():
                 self.texture_state = pending_state
                 self.texture_source = out
@@ -1147,6 +1500,28 @@ class MainWindow(QMainWindow):
             # A full textured run replaces the geometry-only reference.
             self.texture_state = None
             self.texture_source = None
+        elif kind == "stage2":
+            if pending_state is not None and pending_state.is_file():
+                self.texture_state = pending_state
+                self.texture_source = out
+                self.log("2nd stage finished; Generate Texture is available.",
+                         "ok")
+            else:
+                self.texture_state = None
+                self.texture_source = None
+                self.log("2nd stage finished, but its texture state was not "
+                         "saved; Generate Texture is unavailable.", "warn")
+            low = out.with_name("prediction_512.glb")
+            if out.is_file() and low.is_file():
+                self.compare_low = low
+                self.compare_high = out
+                self.compare_align = None
+                self.log("Show low / Show high is available "
+                         "(prediction_512.glb vs prediction.glb).", "ok")
+            else:
+                self.compare_low = None
+                self.compare_high = None
+                self.compare_align = None
         # kind == "texture": keep the geometry state for further re-textures.
         same_model = (
             kind == "texture"

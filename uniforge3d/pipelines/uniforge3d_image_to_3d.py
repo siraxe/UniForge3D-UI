@@ -646,6 +646,147 @@ class UniForge3DImageTo3DPipeline:
             raise ValueError(f"Shape state has no view assignment: {source}")
         return normalized, view_assignment, state
 
+    @staticmethod
+    def _save_shape512_state(path: str | Path, mesh: trimesh.Trimesh) -> None:
+        """Persist the postprocessed Shape-512 mesh for ``run_stage2``."""
+        target = Path(path).expanduser().resolve()
+        target.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "format": 1,
+            "vertices": torch.from_numpy(mesh.vertices.astype("float32", copy=False)),
+            "faces": torch.from_numpy(mesh.faces.astype("int64", copy=False)),
+        }
+        temporary = target.with_name(target.name + ".tmp")
+        try:
+            torch.save(payload, temporary)
+            os.replace(temporary, target)
+        finally:
+            temporary.unlink(missing_ok=True)
+        print(f"[shape512-state] wrote {target}", flush=True)
+
+    @staticmethod
+    def _load_shape512_state(path: str | Path) -> trimesh.Trimesh:
+        """Load a Shape-512 mesh checkpoint written by ``_save_shape512_state``."""
+        source = Path(path).expanduser().resolve()
+        try:
+            state = torch.load(source, map_location="cpu", weights_only=True)
+        except Exception as error:
+            raise ValueError(f"Could not read Shape-512 state: {source}") from error
+        if not isinstance(state, dict) or state.get("format") != 1:
+            raise ValueError(f"Unsupported Shape-512 state file: {source}")
+        try:
+            return trimesh.Trimesh(
+                vertices=state["vertices"].float().numpy(),
+                faces=state["faces"].long().numpy(),
+                process=False,
+            )
+        except (KeyError, TypeError, AttributeError) as error:
+            raise ValueError(f"Invalid Shape-512 state file: {source}") from error
+
+    @torch.no_grad()
+    def run_stage2(
+        self,
+        images: Sequence[str | Path],
+        output: str | Path,
+        shape512_state: str | Path,
+        *,
+        seed: int | None = None,
+        overwrite: bool = False,
+        texture: bool = False,
+        save_textures: bool = False,
+        save_shape_state: str | Path | None = None,
+    ) -> Path:
+        """Run the Shape-1024 upscale from a saved Shape-512 mesh.
+
+        ``shape512_state`` is the sidecar written by
+        ``run(..., stop_after_shape512=True, save_shape512_state=...)``.
+        The sparse structure and Shape-512 model are not re-run; only DINO
+        features, the Shape-1024 model and the requested output stage are
+        executed.
+        """
+        output_path = Path(output).expanduser().resolve()
+        if output_path.exists() and (not overwrite or not output_path.is_file()):
+            raise FileExistsError(
+                f"Output already exists: {output_path}; use --overwrite to recompute"
+            )
+        shape512_mesh = self._load_shape512_state(shape512_state)
+        seed = self.config["default_seed"] if seed is None else seed
+
+        batch = self._preprocess_images(images)
+
+        torch.cuda.set_device(self.device)
+        torch.manual_seed(seed)
+        self._stage_started = time.perf_counter()
+        try:
+            self._stage = "dino features"
+            dino_features = self._encode_dino(batch)
+            self._discard_from_vram(self.dino)
+            self._release("preprocess")
+            self._report_vram("dino features")
+
+            self._stage = "shape1024"
+            structure_conditioned_coords = self._shape512_to_coords64(shape512_mesh)
+            del shape512_mesh
+            shape1024_latent, view_assignment = self._generate_shape1024(
+                batch,
+                structure_conditioned_coords,
+                dino_features["shape1024"],
+            )
+            if save_shape_state is not None:
+                try:
+                    self._save_shape_state(
+                        save_shape_state,
+                        shape1024_latent,
+                        view_assignment,
+                        num_images=len(images),
+                        grid_size=self.config["mesh_postprocess"]["grid_size"],
+                        texture_size=self.config["texture"]["texture_size"],
+                    )
+                except Exception as error:
+                    print(
+                        f"[shape-state] warning: could not save "
+                        f"{save_shape_state}: {error}",
+                        flush=True,
+                    )
+            self._discard_from_vram(self.shape1024_model)
+            self._release("shape1024")
+
+            if texture:
+                texture_mesh = self._generate_texture(
+                    batch,
+                    shape1024_latent,
+                    view_assignment,
+                    dino_features["shape1024"],
+                )
+            else:
+                texture_mesh = self._generate_shape1024_mesh(shape1024_latent)
+            self._release("texture", "conditioner")
+            self._report_vram(
+                "texture export" if texture else "geometry postprocess")
+
+            self._stage = "GLB export"
+            published = export_glb(texture_mesh, output_path, overwrite=overwrite)
+            if save_textures and texture:
+                for path in save_texture_maps(
+                        texture_mesh, published.parent / "textures"):
+                    print(f"[textures] wrote {path}", flush=True)
+            return published
+        except RuntimeError as error:
+            if (not isinstance(error, torch.cuda.OutOfMemoryError)
+                    and "out of memory" not in str(error).lower()):
+                raise
+            try:
+                free, total = torch.cuda.mem_get_info(self.device)
+                footprint = f" ({free / 2**30:.1f} of {total / 2**30:.1f} GB free)"
+            except Exception:
+                footprint = ""
+            raise RuntimeError(
+                f"CUDA out of memory during {self._stage}{footprint}. "
+                "Close other GPU apps or lower Geometry output grid in the UI."
+            ) from error
+        finally:
+            release_cuda()
+
     @torch.no_grad()
     def run_texture(
         self,
@@ -748,7 +889,17 @@ class UniForge3DImageTo3DPipeline:
         texture: bool = True,
         save_textures: bool = False,
         save_shape_state: str | Path | None = None,
+        stop_after_shape512: bool = False,
+        save_shape512_state: str | Path | None = None,
     ) -> Path:
+        """Generate a GLB from input images.
+
+        ``stop_after_shape512`` decodes and exports the Shape-512 mesh and
+        skips the Shape-1024 upscale (and therefore texturing). It is meant
+        for inspecting the first geometry stage without paying for 1024.
+        ``save_shape512_state`` writes the decoded Shape-512 mesh so a later
+        :meth:`run_stage2` call can resume the 1024 upscale from it.
+        """
 
         output_path = Path(output).expanduser().resolve()
         if output_path.exists() and (not overwrite or not output_path.is_file()):
@@ -799,6 +950,24 @@ class UniForge3DImageTo3DPipeline:
             self._discard_from_vram(self.shape512_model, self.shape512_decoder)
             self._release("shape512")
             self._report_vram("stage2 shape512 decode")
+
+            if stop_after_shape512:
+                # Diagnostic / fast path: the Shape-512 mesh is already
+                # decoded and postprocessed, so publish it as-is and skip
+                # the Shape-1024 upscale and texture stages.
+                if save_shape512_state is not None:
+                    # Keep the preview usable by run_stage2; like the Shape
+                    # state sidecar, a failed write must not lose the export.
+                    try:
+                        self._save_shape512_state(save_shape512_state, shape512_mesh)
+                    except Exception as error:
+                        print(
+                            f"[shape512-state] warning: could not save "
+                            f"{save_shape512_state}: {error}",
+                            flush=True,
+                        )
+                self._stage = "GLB export (Shape-512)"
+                return export_glb(shape512_mesh, output_path, overwrite=overwrite)
 
             self._stage = "shape1024"
             structure_conditioned_coords = self._shape512_to_coords64(shape512_mesh)
