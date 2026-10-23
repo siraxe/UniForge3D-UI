@@ -14,6 +14,10 @@ Feature parity with the Flet UI:
     Run 2nd stage can later resume the 1024 upscale from that saved mesh,
     then Show low / Show high swaps prediction_512.glb and prediction.glb
     in place (camera and material preserved)
+  - Run Hi3D 1536 refines the same saved Shape-512 mesh with Hi3D v1.0 at
+    1536 resolution (image-conditioned, geometry only) and loads
+    prediction_hi3d_1536.glb next to the preview. It runs in one-shot
+    hi3d_worker.py so its transformers/VAE unload immediately afterwards.
 
 Generation runs in a separate worker process (worker.py in this directory) so
 Stop can hard-kill a run and this process stays lightweight (no torch import).
@@ -43,11 +47,12 @@ from PySide6.QtWidgets import (
 )
 
 import viewer as viewer_mod
-from model_paths import find_model_dir
+from model_paths import find_model_dir, missing_hi3d_assets
 
 ROOT = Path(__file__).resolve().parent.parent
 WORKER = Path(__file__).resolve().parent / "worker.py"
 RMBG_WORKER = Path(__file__).resolve().parent / "rmbg_worker.py"
+HI3D_WORKER = Path(__file__).resolve().parent / "hi3d_worker.py"
 MODEL_DIR = find_model_dir()
 OUTPUT_DIR = ROOT / "output_dir"
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}
@@ -73,6 +78,11 @@ def _textured_output_path(glb: Path) -> Path:
 def _high_output_path(low_glb: Path) -> Path:
     """Shape-512 preview GLB -> the Shape-1024 GLB in the same folder."""
     return low_glb.with_name("prediction.glb")
+
+
+def _hi3d_output_path(low_glb: Path) -> Path:
+    """Shape-512 preview GLB -> the Hi3D 1536 GLB in the same folder."""
+    return low_glb.with_name("prediction_hi3d_1536.glb")
 
 
 # ---------------------------------------------------------------------------
@@ -278,7 +288,8 @@ class _WorkerReader(QThread):
     log_line = Signal(str, str)          # msg, level
     job_done = Signal(str, object)       # output path, seed used
     job_failed = Signal(str)             # error message
-    worker_dead = Signal(int)            # exit code
+    worker_dead = Signal(int)            # nonzero exit code
+    reader_finished = Signal(int)        # exit code, always emitted
 
     def __init__(self, proc: subprocess.Popen, parent=None):
         super().__init__(parent)
@@ -311,6 +322,7 @@ class _WorkerReader(QThread):
             code = proc.wait()
             if code not in (0, None):
                 self.worker_dead.emit(code)
+            self.reader_finished.emit(code if code is not None else 0)
 
 
 class WorkerController(QObject):
@@ -480,6 +492,163 @@ class WorkerController(QObject):
                 self._proc.kill()
         self._proc = None
         self._reap_reader()
+
+
+# ---------------------------------------------------------------------------
+# Hi3D v1.0 refinement worker plumbing (one-shot process per refine)
+# ---------------------------------------------------------------------------
+class Hi3DController(QObject):
+    """Runs hi3d_worker.py: load Hi3D, refine one mesh, exit.
+
+    A fresh process per refinement keeps the ~11 GB of Hi3D weights out of
+    the UniForge3D worker and releases them the moment the job ends.
+    """
+
+    log_line = Signal(str, str)
+    state_changed = Signal(bool)         # True while refining
+    refine_done = Signal(str, object)    # output path, seed used
+    refine_failed = Signal(str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._proc: subprocess.Popen | None = None
+        self._reader: _WorkerReader | None = None
+        self._refining = False
+        self.low_vram = True
+
+    @property
+    def refining(self) -> bool:
+        return self._refining
+
+    def set_low_vram(self, enabled: bool) -> None:
+        self.low_vram = bool(enabled)
+
+    def start(self, image: Path, coarse_mesh: Path, output: Path, *,
+              resolution: int = 1536, seed=None):
+        if self._refining:
+            return
+        # A finished one-shot worker may still be shutting down; reap it
+        # before spawning the next refinement.
+        if self._proc is not None and self._proc.poll() is None:
+            self.stop()
+        args = [sys.executable, str(HI3D_WORKER),
+                "--model-dir", str(MODEL_DIR),
+                "--low-vram" if self.low_vram else "--no-low-vram"]
+        self._proc = subprocess.Popen(
+            args,
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            text=True, encoding="utf-8", bufsize=1, cwd=str(ROOT),
+        )
+        self._reader = _WorkerReader(self._proc, self)
+        self._reader.log_line.connect(self.log_line)
+        self._reader.job_done.connect(self._on_done)
+        self._reader.job_failed.connect(self._on_failed)
+        self._reader.worker_dead.connect(self._on_dead)
+        self._reader.reader_finished.connect(self._on_reader_finished)
+        self._reader.start()
+        # The worker only reads stdin after its ~11 GB model load, so this
+        # small command simply waits in the pipe buffer.
+        cmd = {
+            "cmd": "refine",
+            "image": str(image),
+            "coarse_mesh": str(coarse_mesh),
+            "output": str(output),
+            "resolution": int(resolution),
+            "seed": seed,
+        }
+        self._proc.stdin.write(json.dumps(cmd) + "\n")
+        self._proc.stdin.flush()
+        self._refining = True
+        self.state_changed.emit(True)
+
+    def stop(self):
+        """Hard-kill the worker; a stopped refine leaves no partial output."""
+        if self._proc is None and self._reader is None:
+            return
+        proc, self._proc = self._proc, None
+        if self._reader is not None:
+            for signal, slot in (
+                (self._reader.job_done, self._on_done),
+                (self._reader.job_failed, self._on_failed),
+                (self._reader.worker_dead, self._on_dead),
+                (self._reader.reader_finished, self._on_reader_finished),
+            ):
+                try:
+                    signal.disconnect(slot)
+                except (RuntimeError, TypeError):
+                    pass
+        if proc is not None and proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        self._reap_reader()
+        self._refining = False
+        self.state_changed.emit(False)
+
+    def _reap_reader(self):
+        """Let the stdout reader finish so no QThread outlives its parent."""
+        if self._reader is None:
+            return
+        if not self._reader.wait(3000):
+            self._reader.terminate()
+            self._reader.wait(1000)
+        self._reader = None
+
+    def _on_done(self, output: str, seed=None):
+        self._refining = False
+        self.state_changed.emit(False)
+        self.refine_done.emit(output, seed)
+
+    def _on_failed(self, msg: str):
+        self._refining = False
+        self.state_changed.emit(False)
+        self.refine_failed.emit(msg)
+
+    def _on_dead(self, code: int):
+        if self._refining:
+            self._refining = False
+            self.state_changed.emit(False)
+            self.refine_failed.emit(
+                f"Hi3D worker exited unexpectedly (code {code}).")
+        self.log_line.emit(f"Hi3D worker process exited (code {code}).",
+                           "warn")
+
+    def _on_reader_finished(self, code: int):
+        # Ignore a late signal from a worker that a newer run replaced.
+        if self.sender() is not self._reader:
+            return
+        self._reap_reader()
+        proc, self._proc = self._proc, None
+        if proc is not None and proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+
+    def shutdown(self):
+        if self._reader is not None:
+            for signal, slot in (
+                (self._reader.job_done, self._on_done),
+                (self._reader.job_failed, self._on_failed),
+                (self._reader.worker_dead, self._on_dead),
+                (self._reader.reader_finished, self._on_reader_finished),
+            ):
+                try:
+                    signal.disconnect(slot)
+                except (RuntimeError, TypeError):
+                    pass
+        proc, self._proc = self._proc, None
+        if proc is not None and proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        self._reap_reader()
+        self._refining = False
 
 
 # ---------------------------------------------------------------------------
@@ -685,6 +854,12 @@ class MainWindow(QMainWindow):
         self.worker.generation_done.connect(self._on_done)
         self.worker.generation_failed.connect(self._on_failed)
 
+        self.hi3d = Hi3DController(self)
+        self.hi3d.log_line.connect(self._on_worker_log)
+        self.hi3d.state_changed.connect(self._on_state_changed)
+        self.hi3d.refine_done.connect(self._on_hi3d_done)
+        self.hi3d.refine_failed.connect(self._on_hi3d_failed)
+
         self.rmbg = RmbgController(OUTPUT_DIR / ".cutouts", self)
         self.rmbg.log_line.connect(lambda m: self.log(m, "info"))
         self.rmbg.cutout_ready.connect(self._on_cutout_ready)
@@ -874,7 +1049,31 @@ class MainWindow(QMainWindow):
             "available afterwards.")
         self.btn_stage2.clicked.connect(self.on_run_stage2)
         stage2_row.addWidget(self.btn_stage2)
+
+        self.btn_hi3d = QPushButton("Run Hi3D 1536")
+        self.btn_hi3d.setFixedHeight(28)
+        self.btn_hi3d.setVisible(False)
+        self.btn_hi3d.setToolTip(
+            "Refine the Early stop geometry with Hi3D v1.0 at 1536 "
+            "resolution, conditioned on the selected REF image (or the "
+            "run's first image when no REF is selected).\n"
+            "Geometry only: writes prediction_hi3d_1536.glb next to the "
+            "Shape-512 preview. Hi3D runs in its own process and unloads "
+            "when done; memory use is very high.")
+        self.btn_hi3d.clicked.connect(self.on_run_hi3d)
+        stage2_row.addWidget(self.btn_hi3d)
         stage2_row.addStretch(1)
+
+        # Hi3D v1.0's license asks integrations to credit it with a link.
+        self.hi3d_credit = QLabel(
+            'Powered by <a href="http://hi3d.ai/">Hi3D 1.0</a>')
+        self.hi3d_credit.setTextFormat(Qt.RichText)
+        self.hi3d_credit.setOpenExternalLinks(True)
+        self.hi3d_credit.setToolTip("Hi3D v1.0 refinement (http://hi3d.ai/).")
+        self.hi3d_credit.setStyleSheet("font-size: 10px;")
+        self.hi3d_credit.setVisible(False)
+        stage2_row.addWidget(self.hi3d_credit)
+
         stage2_box = QWidget()
         stage2_box.setLayout(stage2_row)
         form.addRow(stage2_box)
@@ -1018,8 +1217,9 @@ class MainWindow(QMainWindow):
 
     def _refresh_buttons(self):
         busy = self.worker.generating
+        refining = self.hi3d.refining
         cutting = self.rmbg.running
-        idle = not busy and not cutting
+        idle = not busy and not cutting and not refining
         has_images = bool(self.image_paths)
         has_texture_state = bool(
             self.texture_state and self.texture_state.is_file())
@@ -1031,7 +1231,11 @@ class MainWindow(QMainWindow):
         if hasattr(self, "btn_stage2"):
             self.btn_stage2.setVisible(has_stage1_state)
             self.btn_stage2.setEnabled(idle and has_stage1_state)
-        self.btn_stop.setEnabled(busy)
+        if hasattr(self, "btn_hi3d"):
+            self.btn_hi3d.setVisible(has_stage1_state)
+            self.btn_hi3d.setEnabled(idle and has_stage1_state)
+            self.hi3d_credit.setVisible(has_stage1_state)
+        self.btn_stop.setEnabled(busy or refining)
         self.btn_rmbg.setEnabled(idle and has_images)
         if hasattr(self, "low_vram_check"):
             self.low_vram_check.setEnabled(idle)
@@ -1045,6 +1249,8 @@ class MainWindow(QMainWindow):
             self._update_compare_button()
         if cutting:
             activity = "Running: background removal"
+        elif refining:
+            activity = "Running: Hi3D 1536 refinement"
         elif busy:
             if self._pending_kind == "texture":
                 activity = "Running: texture generation"
@@ -1075,7 +1281,8 @@ class MainWindow(QMainWindow):
                        and current.resolve() == self.compare_low.resolve())
         self.btn_compare.setText("Show high" if showing_low else "Show low")
         self.btn_compare.setEnabled(
-            not self.worker.generating and not self.rmbg.running)
+            not self.worker.generating and not self.rmbg.running
+            and not self.hi3d.refining)
 
     # -- Handlers ---------------------------------------------------------
     def viewer_reset(self):
@@ -1107,7 +1314,7 @@ class MainWindow(QMainWindow):
 
     def on_remove_background(self):
         """Cut out all imported images with RMBG-2.0 in a light process."""
-        if self.worker.generating or self.rmbg.running:
+        if self.worker.generating or self.rmbg.running or self.hi3d.refining:
             return
         todo = [p for p in self.image_paths if p not in self.cutout_map]
         if not todo:
@@ -1146,7 +1353,7 @@ class MainWindow(QMainWindow):
             start()
 
     def on_generate(self):
-        if self.worker.generating or self.rmbg.running:
+        if self.worker.generating or self.rmbg.running or self.hi3d.refining:
             return
         if not self.image_paths:
             QMessageBox.information(self, "UniForge3D",
@@ -1211,7 +1418,7 @@ class MainWindow(QMainWindow):
         self.log("Generation queued.", "info")
 
     def on_run_stage2(self):
-        if self.worker.generating or self.rmbg.running:
+        if self.worker.generating or self.rmbg.running or self.hi3d.refining:
             return
         if self.stage1_state is None or not self.stage1_state.is_file():
             QMessageBox.information(
@@ -1255,8 +1462,87 @@ class MainWindow(QMainWindow):
         self.log("Running 2nd stage: Shape-1024 upscale from the saved "
                  "Shape-512 mesh (stage 1 is not re-run) ...", "info")
 
+    def _hi3d_condition_image(self) -> Path | None:
+        """Single Hi3D condition image: the REF selection when it was used.
+
+        REF points at an original import while the Early stop run stored
+        cutout-substituted paths, so map through cutout_map first. If no REF
+        is selected (or it was not part of that run), use the run's first
+        image.
+        """
+        if not self.stage1_images:
+            return None
+        run_images = {p.resolve() for p in self.stage1_images}
+        if self.ref_reference is not None:
+            source = self.ref_reference
+            candidate = self.cutout_map.get(source, source)
+            for path in (candidate, source):
+                if path.resolve() in run_images:
+                    return path
+            self.log("The selected REF image was not part of the Early stop "
+                     "run; using that run's first image for Hi3D.", "warn")
+        return self.stage1_images[0]
+
+    def on_run_hi3d(self):
+        if self.worker.generating or self.rmbg.running or self.hi3d.refining:
+            return
+        if self.stage1_state is None or not self.stage1_state.is_file():
+            QMessageBox.information(
+                self, "UniForge3D",
+                "Run a generation with Early stop enabled first; Run Hi3D "
+                "1536 refines its saved Shape-512 mesh.")
+            self._refresh_buttons()
+            return
+        if self.stage1_source is None or not self.stage1_source.is_file():
+            QMessageBox.warning(
+                self, "UniForge3D",
+                "The Early stop GLB is missing; run that generation again.")
+            return
+        if not self.stage1_images:
+            QMessageBox.warning(
+                self, "UniForge3D",
+                "The reference image from the Early stop run is missing; "
+                "run that generation again.")
+            return
+        image = self._hi3d_condition_image()
+        if image is None or not image.is_file():
+            QMessageBox.warning(
+                self, "UniForge3D",
+                f"Reference image not found:\n{image}")
+            return
+        missing = missing_hi3d_assets(MODEL_DIR)
+        if missing:
+            self.log("Hi3D is not ready; missing: " + "; ".join(missing),
+                     "error")
+            shown = "\n".join(missing[:8])
+            if len(missing) > 8:
+                shown += f"\n... and {len(missing) - 8} more"
+            QMessageBox.warning(
+                self, "Hi3D is not ready",
+                "Hi3D 1536 needs the Hi3D v1.0 source and its models.\n"
+                "Run get_models.bat first.\n\nMissing:\n" + shown)
+            return
+        output_path = _hi3d_output_path(self.stage1_source)
+        # The idle UniForge3D worker keeps its pipeline resident; release it
+        # so Hi3D 1536 gets the full GPU. It reloads on the next generation.
+        if self.worker.alive:
+            self.worker.stop()
+            self.log("UniForge3D worker unloaded to free GPU memory for "
+                     "Hi3D.", "info")
+        self._pending_kind = "hi3d"
+        self._pending_state = None
+        self._pending_images = None
+        self.btn_folder.setVisible(False)
+        self._refresh_buttons()
+        self.hi3d.start(
+            image, self.stage1_source, output_path, resolution=1536,
+            seed=(None if self.seed_spin.value() < 0
+                  else self.seed_spin.value()))
+        self.log(f"Running Hi3D 1536: refining {self.stage1_source.name} "
+                 f"with {image.name} (25 steps, geometry only) ...", "info")
+
     def on_generate_texture(self):
-        if self.worker.generating or self.rmbg.running:
+        if self.worker.generating or self.rmbg.running or self.hi3d.refining:
             return
         if self.texture_state is None or not self.texture_state.is_file():
             QMessageBox.information(
@@ -1314,6 +1600,7 @@ class MainWindow(QMainWindow):
 
     def _on_low_vram_toggled(self, checked: bool):
         self.worker.set_low_vram(checked)
+        self.hi3d.set_low_vram(checked)
         message = (
             "Low VRAM enabled: only the active stage stays on the GPU."
             if checked else
@@ -1360,6 +1647,13 @@ class MainWindow(QMainWindow):
         self._pending_images = None
 
     def on_stop(self):
+        if self.hi3d.refining:
+            self.hi3d.stop()
+            self._clear_pending_job()
+            self.log("Hi3D refinement stopped (worker killed); Hi3D reloads "
+                     "on the next refinement.", "warn")
+            self._refresh_buttons()
+            return
         if not self.worker.generating:
             return
         self.worker.stop()
@@ -1547,12 +1841,42 @@ class MainWindow(QMainWindow):
         QMessageBox.warning(self, "Generation failed", msg)
         self._refresh_buttons()
 
+    def _on_hi3d_done(self, output: str, seed=None):
+        self._clear_pending_job()
+        out = Path(output)
+        self.log(f"Hi3D 1536 finished -> {output}", "ok")
+        if seed is not None:
+            try:
+                self.last_seed = int(seed)
+            except (TypeError, ValueError):
+                pass
+            else:
+                self._update_seed_button()
+        self.last_output = out
+        self.btn_folder.setVisible(True)
+        self.log("Hi3D recenters the result and normalizes it to unit "
+                 "radius; absolute scale is not preserved.", "info")
+        if self.viewer.load(output):
+            self.log(f"Loaded Hi3D result into viewer: {out.name}", "ok")
+        else:
+            self.log("Could not display the Hi3D result in viewer.", "error")
+        # Published next to the GLB, like every other completed run.
+        self.converter.convert(out)
+        self._refresh_buttons()
+
+    def _on_hi3d_failed(self, msg: str):
+        self._clear_pending_job()
+        self.log(msg, "error")
+        QMessageBox.warning(self, "Hi3D refinement failed", msg)
+        self._refresh_buttons()
+
     # -- misc -----------------------------------------------------------------
     def log(self, msg: str, level: str = "info"):
         self.log_box.appendPlainText(msg)
 
     def closeEvent(self, event):
         self.rmbg.shutdown()
+        self.hi3d.shutdown()
         self.worker.shutdown()
         super().closeEvent(event)
 

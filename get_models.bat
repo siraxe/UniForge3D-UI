@@ -2,14 +2,19 @@
 setlocal EnableExtensions
 cd /d "%~dp0"
 
-rem Download every model file needed by UniForge3D into:
+rem Download every model file needed by UniForge3D and Hi3D v1.0 into:
 rem   models\<owner>\<repo>\...
 rem
 rem Public sources only:
 rem   Hugging Face: xibushu/UniForge3D, microsoft/TRELLIS.2-4B,
-rem                 microsoft/TRELLIS-image-large
+rem                 microsoft/TRELLIS-image-large,
+rem                 hi3d-official/Hi3Dv1.0 (Run Hi3D 1536),
+rem                 facebook/dinov2-large and
+rem                 openai/clip-vit-large-patch14 (Hi3D encoders)
 rem   ModelScope:   public mirrors of gated facebook/dinov3... and
 rem                 briaai/RMBG-2.0
+rem
+rem Hi3D v1.0 adds about 10.7 GB. Existing files are skipped on rerun.
 rem
 rem No models\hf_cache is created: files are fetched directly.
 rem

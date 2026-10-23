@@ -1,0 +1,17 @@
+# Local build and Python environments
+/build/
+/dist/
+/.venv/
+/.ruff_cache/
+/.pytest_cache/
+/*.egg-info/
+*.so
+**/__pycache__/
+*.pyc
+output*/
+
+# Large generated assets
+*.glb
+*.safetensors
+*.pt
+*.npz

@@ -2,17 +2,30 @@
 
 Only public, ungated sources are used:
 
-* Hugging Face for the open UniForge3D and Microsoft TRELLIS repositories.
+* Hugging Face for the open UniForge3D, Microsoft TRELLIS, Hi3D v1.0,
+  DINOv2-large, and CLIP ViT-L/14 repositories.
 * ModelScope public mirrors for DINOv3 and RMBG-2.0, whose Hugging Face
   repositories are gated.
 
-Downloads go straight to the destination with urllib, so no Hugging Face
-cache (and no ``models/hf_cache``) is created.  A patched local pipeline config
-with checkpoint paths relative to the models tree is written to:
+The Hi3D v1.0 refinement models and their two conditioning encoders are
+downloaded to::
+
+    models/hi3d-official/Hi3Dv1.0/
+    models/facebook/dinov2-large/
+    models/openai/clip-vit-large-patch14/
+
+The original model groups are downloaded straight to the destination with
+urllib, so no global Hugging Face cache (and no ``models/hf_cache``) is
+created. The Hi3D v1.0 model and its DINOv2/CLIP encoders are fetched with
+``huggingface_hub.snapshot_download`` into their final ``models/<owner>/<repo>``
+directories, using an allow-list so duplicate encoder checkpoints are not
+downloaded. A patched local pipeline config with checkpoint paths relative to
+the models tree is written to:
     models/xibushu/UniForge3D/pipeline.json
 
-The script is resumable: existing files with the expected size are skipped and
-``.part`` files are continued with an HTTP Range request.
+The script is resumable: existing files with the expected size are skipped,
+``.part`` files are continued with an HTTP Range request, and snapshot
+downloads resume from their local metadata.
 """
 from __future__ import annotations
 
@@ -65,6 +78,82 @@ class ModelGroup:
     name: str                 # owner/repo directory under models/
     source: str
     files: tuple[DownloadFile, ...]
+
+
+@dataclass(frozen=True)
+class RepoGroup:
+    """Whole Hugging Face repository fetched with ``snapshot_download``.
+
+    ``allow_patterns`` keeps the download to the runtime files we need. For
+    the encoders this avoids fetching the duplicate ``pytorch_model.bin``
+    weights that a literal whole-repo download would include.
+    """
+
+    name: str                 # owner/repo directory under models/
+    source: str
+    repo_id: str
+    revision: str
+    allow_patterns: tuple[str, ...]
+    required_files: tuple[str, ...]
+
+
+REPO_GROUPS: tuple[RepoGroup, ...] = (
+    RepoGroup(
+        "hi3d-official/Hi3Dv1.0",
+        "Hugging Face, open (revision 705fc090)",
+        "hi3d-official/Hi3Dv1.0",
+        "705fc0901c5d896cdcbf1dbf1feaa173e62bdd3a",
+        (
+            "model_index.json",
+            "scheduler/*",
+            "vae/*",
+            "transformer_512/*",
+            "transformer_1024/*",
+        ),
+        (
+            "model_index.json",
+            "scheduler/scheduler_config.json",
+            "vae/config.json",
+            "vae/model.safetensors",
+            "transformer_512/config.json",
+            "transformer_512/model.safetensors",
+            "transformer_1024/config.json",
+            "transformer_1024/model.safetensors",
+        ),
+    ),
+    RepoGroup(
+        "facebook/dinov2-large",
+        "Hugging Face, open (revision 47b73eef); Hi3D conditioning encoder",
+        "facebook/dinov2-large",
+        "47b73eefe95e8d44ec3623f8890bd894b6ea2d6c",
+        (
+            "config.json",
+            "model.safetensors",
+            "preprocessor_config.json",
+        ),
+        (
+            "config.json",
+            "model.safetensors",
+            "preprocessor_config.json",
+        ),
+    ),
+    RepoGroup(
+        "openai/clip-vit-large-patch14",
+        "Hugging Face, open (revision 32bd6428); Hi3D conditioning encoder",
+        "openai/clip-vit-large-patch14",
+        "32bd64288804d66eefd0ccbe215aa642df71cc41",
+        (
+            "config.json",
+            "model.safetensors",
+            "preprocessor_config.json",
+        ),
+        (
+            "config.json",
+            "model.safetensors",
+            "preprocessor_config.json",
+        ),
+    ),
+)
 
 
 GROUPS: tuple[ModelGroup, ...] = (
@@ -494,6 +583,11 @@ def build_local_pipeline(dest_root: Path) -> Path:
 
 def required_paths(dest_root: Path) -> list[Path]:
     paths = [dest_root / group.name / spec.path for group in GROUPS for spec in group.files]
+    paths.extend(
+        dest_root / group.name / relative
+        for group in REPO_GROUPS
+        for relative in group.required_files
+    )
     core_root = dest_root / "xibushu" / "UniForge3D"
     for decoder in (
         dest_root / "microsoft" / "TRELLIS-image-large" / "ckpts" / "ss_dec_conv3d_16l8_fp16",
@@ -535,14 +629,24 @@ def main(argv: list[str] | None = None) -> int:
     all_files = [(group, spec) for group in GROUPS for spec in group.files]
     total_bytes = sum(spec.size for _, spec in all_files)
     total_files = len(all_files)
+    repo_files = [
+        (group, relative)
+        for group in REPO_GROUPS
+        for relative in group.required_files
+    ]
 
-    print("[get_models] UniForge3D model downloader")
+    print("[get_models] UniForge3D + Hi3D model downloader")
     print(f"[get_models] Destination: {dest}")
-    print("[get_models] Layout: <owner>/<repo>/... (direct files, no hf_cache)")
+    print("[get_models] Layout: <owner>/<repo>/... (model files stored directly)")
     print("\n[get_models] Sources:")
+    for group in REPO_GROUPS:
+        print(f"  {group.name:<48} {group.source} [snapshot]")
     for group in GROUPS:
         print(f"  {group.name:<48} {group.source}")
-    print(f"\n[get_models] Required: {total_files} files, {fmt_bytes(total_bytes)}")
+    print(
+        f"\n[get_models] Required: {total_files + len(repo_files)} files "
+        f"({fmt_bytes(total_bytes)} explicit + ~10.7 GB Hi3D snapshot)"
+    )
 
     present: list[tuple[ModelGroup, DownloadFile, Path]] = []
     missing: list[tuple[ModelGroup, DownloadFile, Path]] = []
@@ -573,22 +677,42 @@ def main(argv: list[str] | None = None) -> int:
                     )
                 missing.append((group, spec, path))
 
+    repo_present = [
+        (group, relative)
+        for group, relative in repo_files
+        if (dest / group.name / relative).is_file()
+    ]
+    repo_missing = [
+        (group, relative)
+        for group, relative in repo_files
+        if not (dest / group.name / relative).is_file()
+    ]
+
     present_bytes = sum(spec.size for _, spec, _ in present)
     missing_bytes = sum(spec.size for _, spec, _ in missing)
     print(
-        f"\n[check] Existing: {len(present)}/{total_files} files "
+        f"\n[check] Existing: {len(present)}/{total_files} explicit files "
         f"({fmt_bytes(present_bytes)})"
     )
     print(
-        f"[check] To download: {len(missing)} files "
+        f"[check] To download: {len(missing)} explicit files "
         f"({fmt_bytes(missing_bytes)} expected)"
+    )
+    print(
+        f"[check] Hi3D snapshot repos: {len(repo_present)}/{len(repo_files)} "
+        "runtime files present"
     )
 
     if args.check:
-        if missing:
-            print("\n[check] Missing required files:")
-            for group, spec, _ in missing:
-                print(f"  {group.name}/{spec.path}")
+        if missing or repo_missing:
+            if missing:
+                print("\n[check] Missing explicit files:")
+                for group, spec, _ in missing:
+                    print(f"  {group.name}/{spec.path}")
+            if repo_missing:
+                print("\n[check] Missing Hi3D snapshot files:")
+                for group, relative in repo_missing:
+                    print(f"  {group.name}/{relative}")
             print("\n[check] Nothing was downloaded.")
             return 1
         print("\n[check] All required model files are present.")
@@ -596,6 +720,29 @@ def main(argv: list[str] | None = None) -> int:
 
     current_group = None
     try:
+        from huggingface_hub import snapshot_download
+
+        # Hi3D first: its weights are the large new download.
+        for group in REPO_GROUPS:
+            print(f"\n[{group.name}]")
+            print(f"  {group.source}")
+            snapshot_download(
+                repo_id=group.repo_id,
+                revision=group.revision,
+                allow_patterns=list(group.allow_patterns),
+                local_dir=dest / group.name,
+            )
+            group_missing = [
+                relative
+                for relative in group.required_files
+                if not (dest / group.name / relative).is_file()
+            ]
+            if group_missing:
+                raise RuntimeError(
+                    f"{group.name} is missing required files after download: "
+                    + ", ".join(group_missing)
+                )
+
         for index, (group, spec, path) in enumerate(missing, 1):
             if group.name != current_group:
                 print(f"\n[{group.name}]")
@@ -607,7 +754,7 @@ def main(argv: list[str] | None = None) -> int:
         return 130
     except Exception as exc:  # noqa: BLE001 - show a clean message for network errors
         print(f"\n[get_models] ERROR: {exc}")
-        print("[get_models] Partial .part files were kept; run again to resume.")
+        print("[get_models] Partial downloads are kept; run again to resume.")
         return 1
 
     bad = [
@@ -616,6 +763,11 @@ def main(argv: list[str] | None = None) -> int:
         if not (dest / group.name / spec.path).is_file()
         or (dest / group.name / spec.path).stat().st_size != spec.size
     ]
+    bad.extend(
+        f"{group.name}/{relative}"
+        for group, relative in repo_files
+        if not (dest / group.name / relative).is_file()
+    )
     if bad:
         print("\n[get_models] ERROR: these files are still incomplete:")
         for name in bad:
@@ -641,9 +793,12 @@ def main(argv: list[str] | None = None) -> int:
         config_display = config_path
     python_cmd = r".venv\Scripts\python.exe" if (ROOT / ".venv" / "Scripts" / "python.exe").is_file() else "python"
 
-    print(f"\n[get_models] Complete: {total_files} files, {fmt_bytes(total_bytes)}.")
+    print(
+        f"\n[get_models] Complete: {total_files} explicit files "
+        f"({fmt_bytes(total_bytes)}) plus Hi3D snapshot repos."
+    )
     print(f"[get_models] Local pipeline config: {config_display}")
-    print("[get_models] No Hugging Face cache was created.")
+    print("[get_models] Model files are stored directly under models/.")
     print("\nRun with:")
     print(f'  {python_cmd} infer.py --config "{config_display}"')
     print("\nThe PS6 UI (start_ps6.bat) and infer.py use this models/ tree automatically.")

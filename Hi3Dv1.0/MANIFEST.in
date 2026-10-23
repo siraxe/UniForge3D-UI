@@ -1,0 +1,19 @@
+include sparc3d/ops/flexicubes/LICENSE.txt
+
+# User-facing, so they ship even though they live outside the package.
+recursive-include demo *.py
+recursive-include docs *.md
+include assets/example.png
+
+# Repo-only: the image is how a reader builds the environment, not sdist content.
+prune docker
+
+# Adapted for Hi3D v1.0: include both README languages and their figures.
+include README.zh-CN.md
+include assets/framework.png
+include assets/local-detail-comparison.jpg
+include assets/global-comparison-1.jpg
+include assets/global-comparison-2.jpg
+
+# The optional example install command also uses this constraint file.
+include docker/constraints.txt

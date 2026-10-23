@@ -1,0 +1,18 @@
+# The verified stack from docs/installation.md, as exact versions.
+#
+# docker/Dockerfile exports this as PIP_CONSTRAINT, so every install in the image
+# lands on the versions the released weights were measured against instead of
+# whatever the lower bounds in pyproject.toml happen to resolve to on the day.
+# A constraint pins a version without requesting an install: pyproject.toml still
+# decides what is installed, and a package named here that nothing depends on is
+# not pulled in.
+#
+# The environment variable survives into a running container, which also keeps a
+# later `pip install` of the Hunyuan3D demo extras from taking NumPy past 1.x.
+torch==2.5.0+cu124
+torchvision==0.20.0+cu124
+triton==3.1.0
+spconv-cu120==2.3.6
+flash-attn==2.7.4.post1
+transformers==4.46.3
+numpy==1.26.4

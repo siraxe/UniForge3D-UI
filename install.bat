@@ -42,6 +42,8 @@ for %%W in (
     flex_gemm-1.0.0-cp312-cp312-win_amd64.whl
     o_voxel-0.0.1-cp312-cp312-win_amd64.whl
     nvdiffrast-0.4.0-cp312-cp312-win_amd64.whl
+    cumm_cu130-0.8.2-cp312-cp312-win_amd64.whl
+    spconv_cu130-2.3.8-cp312-cp312-win_amd64.whl
 ) do (
     if not exist "!WHEEL_DIR!\%%W" (
         echo [install] Missing wheel: !WHEEL_DIR!\%%W
@@ -98,7 +100,9 @@ echo [install] torch/torchvision source: https://download.pytorch.org/whl/cu130
 if errorlevel 1 goto :fail
 
 echo [install] Installing local compiled wheels from !WHEEL_DIR! ...
-"!PY!" -m pip install --disable-pip-version-check --no-index --no-deps --find-links "!WHEEL_DIR!" "cumesh==0.0.1" "flex_gemm==1.0.0" "o_voxel==0.0.1" "nvdiffrast==0.4.0"
+rem cumm/spconv are custom CUDA 13 + sm_120 builds (no PyPI wheel exists for
+rem Blackwell on Windows). Install cumm first; spconv links against it.
+"!PY!" -m pip install --disable-pip-version-check --no-index --no-deps --find-links "!WHEEL_DIR!" "cumm-cu130==0.8.2" "spconv-cu130==2.3.8" "cumesh==0.0.1" "flex_gemm==1.0.0" "o_voxel==0.0.1" "nvdiffrast==0.4.0"
 if errorlevel 1 goto :fail
 
 set "FLASH_ATTN_URL=https://huggingface.co/siraxe/wheels/resolve/main/flash_attn-2.8.3%%2Bcu130torch2.13-cp312-cp312-win_amd64.whl"
@@ -107,7 +111,7 @@ echo [install] Installing flash_attn from Hugging Face ...
 if errorlevel 1 goto :fail
 
 echo [install] Smoke test ...
-"!PY!" -c "import torch, torchvision, flash_attn, cumesh, flex_gemm, o_voxel, nvdiffrast; import uniforge3d; print('torch', torch.__version__); print('cuda', torch.version.cuda, 'available', torch.cuda.is_available()); print('uniforge3d OK')"
+"!PY!" -c "import torch, torchvision, flash_attn, cumesh, flex_gemm, o_voxel, nvdiffrast; import cumm, spconv, pyfqmr; from spconv.pytorch import SparseConv3d; import uniforge3d; print('torch', torch.__version__); print('cuda', torch.version.cuda, 'available', torch.cuda.is_available()); print('spconv', spconv.__version__); print('uniforge3d OK')"
 if errorlevel 1 goto :fail
 
 echo.
