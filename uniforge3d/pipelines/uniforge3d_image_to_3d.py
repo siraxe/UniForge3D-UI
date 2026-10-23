@@ -474,6 +474,9 @@ class UniForge3DImageTo3DPipeline:
                 latent,
                 self.config["structured_latent_512"]["decoder"].get("normalization"),
             )[0]
+        # Offload before remeshing: postprocess only needs the mesh tensors, and the
+        # decoder's cached activations otherwise sit beside CuMesh's own buffers.
+        self._discard_from_vram(self.shape512_decoder)
         return official_shape_only_postprocess(
             mesh.vertices,
             mesh.faces,
@@ -576,13 +579,15 @@ class UniForge3DImageTo3DPipeline:
             )
             # The decoder keeps fp32 input/output layers and casts its torso itself.
             shape_vae_latent = shape_vae_latent.replace(shape_vae_latent.feats.float())
-            meshes, _ = decoder(shape_vae_latent, return_subs=True)
-            mesh = meshes[0]
-            mesh.fill_holes()
-            del shape_vae_latent
+            meshes, subs = decoder(shape_vae_latent, return_subs=True)
+            del subs, shape_vae_latent
+        mesh = meshes[0]
+        # Offload the decoder and return its cached blocks before hole filling and
+        # remeshing, which need the mesh but not the decoder or its working set.
         self._discard_from_vram(decoder)
         self._release("texture")
         self._report_vram("shape1024 geometry decode")
+        mesh.fill_holes()
         return official_shape_only_postprocess(
             mesh.vertices,
             mesh.faces,

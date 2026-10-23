@@ -56,6 +56,14 @@ class FlexiDualGridVaeDecoder(SparseUnetVaeDecoder):
         vertices = h.replace((1 + 2 * self.voxel_margin) * F.sigmoid(h.feats[..., 0:3]) - self.voxel_margin)
         intersected = h.replace(h.feats[..., 3:6] > 0)
         quad_lerp = h.replace(F.softplus(h.feats[..., 6:7]))
+        # The decoder's working set is finished; drop its last reference and return the
+        # cached blocks before o_voxel allocates the hashmap and triangle buffers.
+        large = (h.feats.shape[0] * h.feats.shape[1] * h.feats.element_size()
+                 >= sp.config.OFFLOAD_BYTES)
+        out_list[0] = None
+        del h, decoded
+        if large:
+            torch.cuda.empty_cache()
         mesh = [Mesh(*flexible_dual_grid_to_mesh(
             v.coords[:, 1:], v.feats, i.feats, q.feats,
             aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],

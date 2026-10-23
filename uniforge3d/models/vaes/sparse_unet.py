@@ -226,7 +226,9 @@ class SparseResBlockC2S3d(nn.Module):
         h = h.replace(self.norm2(h.feats))
         h = h.replace(F.silu(h.feats))
         h = self.conv2(h)
-        h = h + self.skip_connection(x)
+        # The skip has the same coords; adding it in place avoids a third full-size
+        # tensor at the widest point of the block (20M+ rows in the 1024 decoder).
+        h.feats.add_(self.skip_connection(x).feats)
         if self.pred_subdiv:
             return h, subdiv
         else:
@@ -248,6 +250,54 @@ def _add_parked_residual(feats: torch.Tensor, residual: torch.Tensor) -> None:
     for start in range(0, feats.shape[0], rows):
         stop = min(start + rows, feats.shape[0])
         feats[start:stop].add_(residual[start:stop].to(feats.device))
+
+
+def _rows_per_chunk(feats: torch.Tensor, hidden: int, compute_bytes: int) -> int:
+    """Row count that keeps one chunk's largest transient under MLP_CHUNK_BYTES."""
+    row_bytes = max(feats.shape[1] * compute_bytes, hidden * feats.element_size())
+    return max(1, int(sp.config.MLP_CHUNK_BYTES) // max(1, row_bytes))
+
+
+def _norm_mlp_chunked(norm, mlp, feats: torch.Tensor) -> torch.Tensor:
+    """LayerNorm + MLP over rows in chunks.
+
+    Both operations are per-row, so splitting the row dimension is arithmetically
+    identical to the unchunked call. The MLP's 4x hidden activation is what makes the
+    decoder's final level expensive, and this keeps only one chunk of it alive. The
+    chunked path writes back into ``feats`` so it does not need a second full-size
+    output buffer beside the convolution result.
+    """
+    hidden = mlp[0].out_features
+    rows = _rows_per_chunk(feats, hidden, 4)
+    if rows >= feats.shape[0]:
+        return mlp(norm(feats))
+    for start in range(0, feats.shape[0], rows):
+        stop = min(start + rows, feats.shape[0])
+        feats[start:stop] = mlp(norm(feats[start:stop]))
+    return feats
+
+
+def _output_head_chunked(output_layer: nn.Linear, feats: torch.Tensor) -> torch.Tensor:
+    """Final LayerNorm + output projection over rows in chunks.
+
+    The decoder keeps this layer in fp32 even when the torso is fp16, so the unchunked
+    path promotes the whole feature tensor to fp32 before projecting. Chunking promotes
+    and projects a slice at a time and avoids that full-size temporary.
+    """
+    weight = output_layer.weight
+    out_features = weight.shape[0]
+    compute_bytes = torch.empty((), dtype=weight.dtype).element_size()
+    rows = _rows_per_chunk(feats, out_features, compute_bytes)
+    if rows >= feats.shape[0]:
+        normed = F.layer_norm(feats.to(weight.dtype), feats.shape[-1:])
+        return F.linear(normed, weight, output_layer.bias)
+    out = torch.empty(
+        (feats.shape[0], out_features), dtype=weight.dtype, device=feats.device)
+    for start in range(0, feats.shape[0], rows):
+        stop = min(start + rows, feats.shape[0])
+        normed = F.layer_norm(feats[start:stop].to(weight.dtype), feats.shape[-1:])
+        out[start:stop] = F.linear(normed, weight, output_layer.bias)
+    return out
 
 
 class SparseConvNeXtBlock3d(nn.Module):
@@ -278,8 +328,7 @@ class SparseConvNeXtBlock3d(nn.Module):
         parked = x.feats.numel() * x.feats.element_size() >= sp.config.OFFLOAD_BYTES
         residual = x.feats.cpu() if parked else x.feats
         h = self.conv(x)
-        h = h.replace(self.norm(h.feats))
-        h = h.replace(self.mlp(h.feats))
+        h = h.replace(_norm_mlp_chunked(self.norm, self.mlp, h.feats))
         if parked:
             _add_parked_residual(h.feats, residual)
             return h
@@ -386,9 +435,7 @@ class SparseUnetVaeDecoder(nn.Module):
                         h = block(h, subdiv=guide_subs[i] if guide_subs is not None else None)
                 else:
                     h = block(h)
-        h = h.type(x.dtype)
-        h = h.replace(F.layer_norm(h.feats, h.feats.shape[-1:]))
-        h = self.output_layer(h)
+        h = h.replace(_output_head_chunked(self.output_layer, h.feats))
         if return_subs:
             return h, subs
         else:

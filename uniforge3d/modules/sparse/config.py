@@ -1,6 +1,7 @@
+import os
 from typing import Literal
 
-CONV = 'flex_gemm' 
+CONV = 'flex_gemm'
 DEBUG = False
 ATTN = 'flash_attn'
 
@@ -9,13 +10,22 @@ ATTN = 'flash_attn'
 # caller keeps across a convolution is parked there too.
 OFFLOAD_BYTES = 256 * 1024 * 1024
 
+# Row-chunk budget for the pointwise LayerNorm + MLP inside SparseConvNeXtBlock3d. The
+# expanded hidden tensor is 4x the channel count, so at the decoder's final level it is
+# several GB if materialized for every row at once. LayerNorm and Linear are per-row, so
+# processing rows in chunks is arithmetically identical and bounds the transient.
+MLP_CHUNK_BYTES = 256 * 1024 * 1024
+
 def __from_env():
-    import os
-    
     global CONV
     global DEBUG
     global ATTN
-    
+    global MLP_CHUNK_BYTES
+
+    env_mlp_chunk = os.environ.get('UNIFORGE_MLP_CHUNK_BYTES')
+    if env_mlp_chunk is not None:
+        MLP_CHUNK_BYTES = max(8 * 1024 * 1024, int(env_mlp_chunk))
+
     env_sparse_conv_backend = os.environ.get('SPARSE_CONV_BACKEND')
     env_sparse_debug = os.environ.get('SPARSE_DEBUG')
     env_sparse_attn_backend = os.environ.get('SPARSE_ATTN_BACKEND')
