@@ -356,6 +356,11 @@ class Sparc3DPipeline:
                 pass_index=call_pass_index,
                 num_passes=len(pass_indices),
             )
+            # Sampling leaves the transformer's working set in the CUDA caching
+            # allocator. Hand those blocks back before decoding, whose activation
+            # peak is much larger, so fragmentation cannot cause a spurious OOM.
+            if self._device.type == "cuda":
+                torch.cuda.empty_cache()
             decoded = self._decode_latents(latents, structure)
             has_another_pass = ladder_index < target_index
             decoded_features = self._decoded_feature_count(decoded)
@@ -364,7 +369,11 @@ class Sparc3DPipeline:
                     "decoded feature ceiling exceeded before another pass: "
                     f"{decoded_features} > {DECODE_FEATURE_CEILING}"
                 )
+            self._release_decoded_caches(decoded)
             mesh = self._extract_mesh(decoded)
+            del decoded
+            if self._device.type == "cuda":
+                torch.cuda.empty_cache()
 
             if has_another_pass:
                 next_index = ladder_index + 1
@@ -373,6 +382,9 @@ class Sparc3DPipeline:
                     STRUCTURE_RESOLUTIONS[next_index],
                     PASS_BUDGETS[next_index],
                 )
+                # Only the final pass's mesh is postprocessed; drop this rung's
+                # CPU mesh before the next (larger) decode.
+                del mesh
 
         if mesh is None:
             raise RuntimeError("refinement ladder completed without producing a mesh")
@@ -493,13 +505,42 @@ class Sparc3DPipeline:
         return int(features.shape[0])
 
     @staticmethod
+    def _release_decoded_caches(decoded: Any) -> None:
+        """Drop representations that mesh extraction never reads.
+
+        The decoder leaves space-filling-curve orders, attention padding maps and
+        the sparse-convolution view attached to the point. At multi-million-row
+        resolutions those index arrays are hundreds of MB and would stay resident
+        through extraction.
+        """
+        for key in (
+            "sparse_conv_feat",
+            "serialized_order",
+            "serialized_inverse",
+            "pad",
+            "unpad",
+            "cu_seqlens_key",
+        ):
+            decoded.pop(key, None)
+        decoded.is_sparsified = False
+        decoded.is_serialized = False
+
+    @staticmethod
     def _extract_mesh(decoded: Any) -> Any:
         import trimesh
 
         from sparc3d.sparcubes.extract import point_to_mesh
         from sparc3d.sparcubes.fill_hole import fill_mesh_holes
 
-        mesh = fill_mesh_holes(point_to_mesh(decoded))
+        mesh = point_to_mesh(decoded, release_point=True)
+        # Point-to-mesh has copied everything it needs into the mesh. Release the
+        # decoded point's remaining tensors before hole filling allocates boundary
+        # and triangulation structures of its own.
+        if isinstance(decoded, dict):
+            decoded.clear()
+        if mesh.vertices.is_cuda:
+            torch.cuda.empty_cache()
+        mesh = fill_mesh_holes(mesh)
         if not mesh.success:
             raise RuntimeError("mesh extraction produced an empty isosurface")
         return trimesh.Trimesh(

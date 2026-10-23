@@ -12,6 +12,8 @@
 #   nvdiffrast==0.4.0
 #   cumm-cu130==0.8.2      (Hi3D v1.0; built for CUDA 13 + sm_120)
 #   spconv-cu130==2.3.8    (Hi3D v1.0; built for CUDA 13 + sm_120)
+#   torchcumesh2sdf==0.0.1 (CelloCut; built for CUDA 13 + sm_120, C++20)
+#   cppmodules==0.0.1      (CelloCut; bundles the GMP/MPFR runtime DLLs)
 # flash_attn==2.8.3+cu130torch2.13 is installed from Hugging Face.
 
 # --- torch stack ---
@@ -74,6 +76,12 @@ python-dateutil==2.9.0.post0
 shiboken6==6.12.0
 six==1.17.0
 vtk==9.7.0
+
+# --- CelloCut watertight remeshing (PS6_UI/cello_worker.py) ---
+# Constructive method: no model download, GPU used for the 512^3 UDF.
+# torchcumesh2sdf / cppmodules come from the local .whl builds (see top).
+diso==0.1.4
+pymaxflow==1.3.2
 
 # Optional attention fallback (default is flash_attn; not needed):
 # xformers==0.0.35

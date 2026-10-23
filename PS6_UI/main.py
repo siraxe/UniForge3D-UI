@@ -17,7 +17,16 @@ Feature parity with the Flet UI:
   - Run Hi3D 1536 refines the same saved Shape-512 mesh with Hi3D v1.0 at
     1536 resolution (image-conditioned, geometry only) and loads
     prediction_hi3d_1536.glb next to the preview. It runs in one-shot
-    hi3d_worker.py so its transformers/VAE unload immediately afterwards.
+    hi3d_worker.py so its transformers/VAE unload immediately afterwards;
+    Show low / Show high then compares it with the saved Shape-512 mesh.
+  - Run CelloCut (watertight) repairs the same saved Shape-512 mesh with
+    CelloCut (constructive 512^3 UDF + graph-cut remeshing; no model
+    download). The repaired mesh REPLACES prediction_512.glb in place AND
+    regenerates its prediction_512.shape512.pt state, so Run 2nd stage and
+    Hi3D start from the fixed geometry; the untouched originals are kept
+    (prediction_512_original.glb / .shape512.pt) and the 3D view reloads
+    the repaired mesh. Show low / Show high then compares original vs
+    watertight.
 
 Generation runs in a separate worker process (worker.py in this directory) so
 Stop can hard-kill a run and this process stays lightweight (no torch import).
@@ -28,6 +37,7 @@ Run with:  .venv/Scripts/python.exe PS6_UI/main.py   (or start_ps6.bat)
 """
 
 import json
+import shutil
 import subprocess
 import sys
 import threading
@@ -53,6 +63,7 @@ ROOT = Path(__file__).resolve().parent.parent
 WORKER = Path(__file__).resolve().parent / "worker.py"
 RMBG_WORKER = Path(__file__).resolve().parent / "rmbg_worker.py"
 HI3D_WORKER = Path(__file__).resolve().parent / "hi3d_worker.py"
+CELLO_WORKER = Path(__file__).resolve().parent / "cello_worker.py"
 MODEL_DIR = find_model_dir()
 OUTPUT_DIR = ROOT / "output_dir"
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}
@@ -83,6 +94,18 @@ def _high_output_path(low_glb: Path) -> Path:
 def _hi3d_output_path(low_glb: Path) -> Path:
     """Shape-512 preview GLB -> the Hi3D 1536 GLB in the same folder."""
     return low_glb.with_name("prediction_hi3d_1536.glb")
+
+
+def _cellocut_output_path(low_glb: Path) -> Path:
+    """Shape-512 preview GLB -> CelloCut's scratch output in the same folder.
+    On success this file replaces the Shape-512 GLB itself."""
+    return low_glb.with_name("prediction_512_cellocut.glb")
+
+
+def _cellocut_backup_path(low_glb: Path) -> Path:
+    """Shape-512 preview GLB -> backup of the unfixed mesh, written the
+    first time CelloCut replaces it."""
+    return low_glb.with_name("prediction_512_original.glb")
 
 
 # ---------------------------------------------------------------------------
@@ -524,7 +547,7 @@ class Hi3DController(QObject):
         self.low_vram = bool(enabled)
 
     def start(self, image: Path, coarse_mesh: Path, output: Path, *,
-              resolution: int = 1536, seed=None):
+              resolution: int = 1536, seed=None, start_structure=None):
         if self._refining:
             return
         # A finished one-shot worker may still be shutting down; reap it
@@ -556,6 +579,8 @@ class Hi3DController(QObject):
             "resolution": int(resolution),
             "seed": seed,
         }
+        if start_structure is not None:
+            cmd["start_structure"] = int(start_structure)
         self._proc.stdin.write(json.dumps(cmd) + "\n")
         self._proc.stdin.flush()
         self._refining = True
@@ -649,6 +674,159 @@ class Hi3DController(QObject):
                 proc.kill()
         self._reap_reader()
         self._refining = False
+
+
+# ---------------------------------------------------------------------------
+# CelloCut watertight-remeshing worker plumbing (one-shot process per run)
+# ---------------------------------------------------------------------------
+class CelloCutController(QObject):
+    """Runs cello_worker.py: load the CelloCut modules, repair one mesh,
+    exit. CelloCut uses no network weights, but the 512^3 UDF rasterization
+    needs the GPU, so a fresh process per run keeps it out of the way of the
+    UniForge3D worker (which is unloaded while this runs, like for Hi3D).
+    """
+
+    log_line = Signal(str, str)
+    state_changed = Signal(bool)         # True while repairing
+    cut_done = Signal(str, object)       # output path, seed (unused)
+    cut_failed = Signal(str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._proc: subprocess.Popen | None = None
+        self._reader: _WorkerReader | None = None
+        self._running = False
+
+    @property
+    def running(self) -> bool:
+        return self._running
+
+    def start(self, mesh: Path, output: Path, *, shape512_state: Path | None = None,
+              voxel_res: int = 512, decimate_ratio: float = 0.95,
+              lambda_fill: int = 20):
+        if self._running:
+            return
+        # A finished one-shot worker may still be shutting down; reap it
+        # before spawning the next run.
+        if self._proc is not None and self._proc.poll() is None:
+            self.stop()
+        self._proc = subprocess.Popen(
+            [sys.executable, str(CELLO_WORKER)],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            text=True, encoding="utf-8", bufsize=1, cwd=str(ROOT),
+        )
+        self._reader = _WorkerReader(self._proc, self)
+        self._reader.log_line.connect(self.log_line)
+        self._reader.job_done.connect(self._on_done)
+        self._reader.job_failed.connect(self._on_failed)
+        self._reader.worker_dead.connect(self._on_dead)
+        self._reader.reader_finished.connect(self._on_reader_finished)
+        self._reader.start()
+        # The worker only reads stdin after its module imports, so this
+        # small command simply waits in the pipe buffer.
+        cmd = {
+            "cmd": "watertight",
+            "mesh": str(mesh),
+            "output": str(output),
+            "voxel_res": int(voxel_res),
+            "decimate_ratio": float(decimate_ratio),
+            "lambda_fill": int(lambda_fill),
+        }
+        if shape512_state is not None:
+            cmd["shape512_state"] = str(shape512_state)
+        self._proc.stdin.write(json.dumps(cmd) + "\n")
+        self._proc.stdin.flush()
+        self._running = True
+        self.state_changed.emit(True)
+
+    def stop(self):
+        """Hard-kill the worker; a stopped run leaves no partial output."""
+        if self._proc is None and self._reader is None:
+            return
+        proc, self._proc = self._proc, None
+        if self._reader is not None:
+            for signal, slot in (
+                (self._reader.job_done, self._on_done),
+                (self._reader.job_failed, self._on_failed),
+                (self._reader.worker_dead, self._on_dead),
+                (self._reader.reader_finished, self._on_reader_finished),
+            ):
+                try:
+                    signal.disconnect(slot)
+                except (RuntimeError, TypeError):
+                    pass
+        if proc is not None and proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        self._reap_reader()
+        self._running = False
+        self.state_changed.emit(False)
+
+    def _reap_reader(self):
+        """Let the stdout reader finish so no QThread outlives its parent."""
+        if self._reader is None:
+            return
+        if not self._reader.wait(3000):
+            self._reader.terminate()
+            self._reader.wait(1000)
+        self._reader = None
+
+    def _on_done(self, output: str, seed=None):
+        self._running = False
+        self.state_changed.emit(False)
+        self.cut_done.emit(output, seed)
+
+    def _on_failed(self, msg: str):
+        self._running = False
+        self.state_changed.emit(False)
+        self.cut_failed.emit(msg)
+
+    def _on_dead(self, code: int):
+        if self._running:
+            self._running = False
+            self.state_changed.emit(False)
+            self.cut_failed.emit(
+                f"CelloCut worker exited unexpectedly (code {code}).")
+        self.log_line.emit(
+            f"CelloCut worker process exited (code {code}).", "warn")
+
+    def _on_reader_finished(self, code: int):
+        # Ignore a late signal from a worker that a newer run replaced.
+        if self.sender() is not self._reader:
+            return
+        self._reap_reader()
+        proc, self._proc = self._proc, None
+        if proc is not None and proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+
+    def shutdown(self):
+        if self._reader is not None:
+            for signal, slot in (
+                (self._reader.job_done, self._on_done),
+                (self._reader.job_failed, self._on_failed),
+                (self._reader.worker_dead, self._on_dead),
+                (self._reader.reader_finished, self._on_reader_finished),
+            ):
+                try:
+                    signal.disconnect(slot)
+                except (RuntimeError, TypeError):
+                    pass
+        proc, self._proc = self._proc, None
+        if proc is not None and proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        self._reap_reader()
+        self._running = False
 
 
 # ---------------------------------------------------------------------------
@@ -860,6 +1038,12 @@ class MainWindow(QMainWindow):
         self.hi3d.refine_done.connect(self._on_hi3d_done)
         self.hi3d.refine_failed.connect(self._on_hi3d_failed)
 
+        self.cellocut = CelloCutController(self)
+        self.cellocut.log_line.connect(self._on_worker_log)
+        self.cellocut.state_changed.connect(self._on_state_changed)
+        self.cellocut.cut_done.connect(self._on_cellocut_done)
+        self.cellocut.cut_failed.connect(self._on_cellocut_failed)
+
         self.rmbg = RmbgController(OUTPUT_DIR / ".cutouts", self)
         self.rmbg.log_line.connect(lambda m: self.log(m, "info"))
         self.rmbg.cutout_ready.connect(self._on_cutout_ready)
@@ -1036,9 +1220,40 @@ class MainWindow(QMainWindow):
         run_box.setLayout(run_row)
         form.addRow(run_box)
 
-        # Appears only after an Early stop run saved a Shape-512 sidecar.
-        stage2_row = QHBoxLayout()
-        stage2_row.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(grp_set)
+
+        # Upscale settings --------------------------------------------------
+        # Shown only after an Early stop run saved a Shape-512 sidecar.
+        self.grp_upscale = QGroupBox("Upscale settings")
+        upscale_col = QVBoxLayout(self.grp_upscale)
+        upscale_col.setContentsMargins(8, 6, 8, 6)
+
+        # Row above "Run 2nd stage": CelloCut watertight repair.
+        cello_row = QHBoxLayout()
+        cello_row.setContentsMargins(0, 0, 0, 0)
+        self.btn_cellocut = QPushButton("Run CelloCut (watertight)")
+        self.btn_cellocut.setFixedHeight(28)
+        self.btn_cellocut.setVisible(False)
+        self.btn_cellocut.setToolTip(
+            "Repair the saved Shape-512 mesh with CelloCut: it rebuilds the "
+            "mesh from a 512^3 unsigned-distance volume, solves a graph-cut "
+            "cell labeling, and returns a strictly watertight solid (fixes "
+            "holes, self-intersections, non-manifold edges).\n"
+            "The repaired mesh REPLACES prediction_512.glb AND its "
+            "prediction_512.shape512.pt state, so both Run 2nd stage and "
+            "Hi3D continue from the fixed geometry. The originals are kept "
+            "once (prediction_512_original.glb / .shape512.pt) and the 3D "
+            "view reloads the repaired mesh.\n"
+            "Needs the GPU (CelloCut wheels are installed by install.bat; "
+            "no model download).")
+        self.btn_cellocut.clicked.connect(self.on_run_cellocut)
+        cello_row.addWidget(self.btn_cellocut)
+        cello_row.addStretch(1)
+        upscale_col.addLayout(cello_row)
+
+        upscale_row = QHBoxLayout()
+        upscale_row.setContentsMargins(0, 0, 0, 0)
+
         self.btn_stage2 = QPushButton("Run 2nd stage")
         self.btn_stage2.setFixedHeight(28)
         self.btn_stage2.setVisible(False)
@@ -1048,21 +1263,34 @@ class MainWindow(QMainWindow):
             "GLB with the refined geometry. Generate Texture becomes "
             "available afterwards.")
         self.btn_stage2.clicked.connect(self.on_run_stage2)
-        stage2_row.addWidget(self.btn_stage2)
+        upscale_row.addWidget(self.btn_stage2)
 
-        self.btn_hi3d = QPushButton("Run Hi3D 1536")
+        self.btn_hi3d = QPushButton("Hi3D 1536 (1-3 pass)")
         self.btn_hi3d.setFixedHeight(28)
         self.btn_hi3d.setVisible(False)
         self.btn_hi3d.setToolTip(
-            "Refine the Early stop geometry with Hi3D v1.0 at 1536 "
-            "resolution, conditioned on the selected REF image (or the "
-            "run's first image when no REF is selected).\n"
+            "Run the full Hi3D v1.0 ladder on the saved Shape-512 mesh: "
+            "passes 1-3 (structure 64 -> 128 -> 192, output 1536), "
+            "conditioned on the selected REF image (or that run's first "
+            "image when no REF is selected).\n"
             "Geometry only: writes prediction_hi3d_1536.glb next to the "
             "Shape-512 preview. Hi3D runs in its own process and unloads "
-            "when done; memory use is very high.")
+            "when done; the final 1536 decode is memory-intensive.")
         self.btn_hi3d.clicked.connect(self.on_run_hi3d)
-        stage2_row.addWidget(self.btn_hi3d)
-        stage2_row.addStretch(1)
+        upscale_row.addWidget(self.btn_hi3d)
+
+        self.btn_hi3d_pass3 = QPushButton("Hi3D 1536 (3 pass only)")
+        self.btn_hi3d_pass3.setFixedHeight(28)
+        self.btn_hi3d_pass3.setVisible(False)
+        self.btn_hi3d_pass3.setToolTip(
+            "Skip Hi3D passes 1-2: voxelize the saved Shape-512 mesh at "
+            "structure 192 and run only pass 3 to 1536, using your mesh "
+            "directly.\nFaster than the full ladder, but the final 1536 "
+            "decode costs the same memory. Geometry only: writes "
+            "prediction_hi3d_1536.glb.")
+        self.btn_hi3d_pass3.clicked.connect(self.on_run_hi3d_pass3)
+        upscale_row.addWidget(self.btn_hi3d_pass3)
+        upscale_row.addStretch(1)
 
         # Hi3D v1.0's license asks integrations to credit it with a link.
         self.hi3d_credit = QLabel(
@@ -1072,12 +1300,12 @@ class MainWindow(QMainWindow):
         self.hi3d_credit.setToolTip("Hi3D v1.0 refinement (http://hi3d.ai/).")
         self.hi3d_credit.setStyleSheet("font-size: 10px;")
         self.hi3d_credit.setVisible(False)
-        stage2_row.addWidget(self.hi3d_credit)
+        upscale_row.addWidget(self.hi3d_credit)
 
-        stage2_box = QWidget()
-        stage2_box.setLayout(stage2_row)
-        form.addRow(stage2_box)
-        layout.addWidget(grp_set)
+        upscale_col.addLayout(upscale_row)
+
+        self.grp_upscale.setVisible(False)
+        layout.addWidget(self.grp_upscale)
 
         # Log ---------------------------------------------------------------
         self.log_box = QPlainTextEdit()
@@ -1106,8 +1334,9 @@ class MainWindow(QMainWindow):
         bar.addSpacing(12)
         self.btn_compare = QPushButton("Show low")
         self.btn_compare.setToolTip(
-            "Swap the viewer between prediction_512.glb (low) and "
-            "prediction.glb (high) from this result, keeping the current "
+            "Swap the viewer between the saved low-resolution mesh and the "
+            "refined high-resolution mesh from this result (Shape-512 vs "
+            "Shape-1024, or Shape-512 vs Hi3D 1536), keeping the current "
             "camera and material.")
         self.btn_compare.setVisible(False)
         self.btn_compare.clicked.connect(self.on_toggle_compare)
@@ -1219,7 +1448,8 @@ class MainWindow(QMainWindow):
         busy = self.worker.generating
         refining = self.hi3d.refining
         cutting = self.rmbg.running
-        idle = not busy and not cutting and not refining
+        repairing = self.cellocut.running
+        idle = not busy and not cutting and not refining and not repairing
         has_images = bool(self.image_paths)
         has_texture_state = bool(
             self.texture_state and self.texture_state.is_file())
@@ -1228,6 +1458,8 @@ class MainWindow(QMainWindow):
         self.btn_generate.setEnabled(idle and has_images)
         self.btn_generate_texture.setVisible(has_texture_state)
         self.btn_generate_texture.setEnabled(idle and has_images)
+        if hasattr(self, "grp_upscale"):
+            self.grp_upscale.setVisible(has_stage1_state)
         if hasattr(self, "btn_stage2"):
             self.btn_stage2.setVisible(has_stage1_state)
             self.btn_stage2.setEnabled(idle and has_stage1_state)
@@ -1235,7 +1467,13 @@ class MainWindow(QMainWindow):
             self.btn_hi3d.setVisible(has_stage1_state)
             self.btn_hi3d.setEnabled(idle and has_stage1_state)
             self.hi3d_credit.setVisible(has_stage1_state)
-        self.btn_stop.setEnabled(busy or refining)
+        if hasattr(self, "btn_hi3d_pass3"):
+            self.btn_hi3d_pass3.setVisible(has_stage1_state)
+            self.btn_hi3d_pass3.setEnabled(idle and has_stage1_state)
+        if hasattr(self, "btn_cellocut"):
+            self.btn_cellocut.setVisible(has_stage1_state)
+            self.btn_cellocut.setEnabled(idle and has_stage1_state)
+        self.btn_stop.setEnabled(busy or refining or repairing)
         self.btn_rmbg.setEnabled(idle and has_images)
         if hasattr(self, "low_vram_check"):
             self.low_vram_check.setEnabled(idle)
@@ -1251,6 +1489,8 @@ class MainWindow(QMainWindow):
             activity = "Running: background removal"
         elif refining:
             activity = "Running: Hi3D 1536 refinement"
+        elif repairing:
+            activity = "Running: CelloCut watertight repair"
         elif busy:
             if self._pending_kind == "texture":
                 activity = "Running: texture generation"
@@ -1484,13 +1724,21 @@ class MainWindow(QMainWindow):
         return self.stage1_images[0]
 
     def on_run_hi3d(self):
+        """Full Hi3D v1.0 ladder (passes 1-3)."""
+        self._run_hi3d(start_structure=None)
+
+    def on_run_hi3d_pass3(self):
+        """Hi3D pass 3 only: feed the saved mesh in at structure 192."""
+        self._run_hi3d(start_structure=192)
+
+    def _run_hi3d(self, *, start_structure):
         if self.worker.generating or self.rmbg.running or self.hi3d.refining:
             return
         if self.stage1_state is None or not self.stage1_state.is_file():
             QMessageBox.information(
                 self, "UniForge3D",
-                "Run a generation with Early stop enabled first; Run Hi3D "
-                "1536 refines its saved Shape-512 mesh.")
+                "Run a generation with Early stop enabled first; Hi3D 1536 "
+                "refines its saved Shape-512 mesh.")
             self._refresh_buttons()
             return
         if self.stage1_source is None or not self.stage1_source.is_file():
@@ -1537,9 +1785,118 @@ class MainWindow(QMainWindow):
         self.hi3d.start(
             image, self.stage1_source, output_path, resolution=1536,
             seed=(None if self.seed_spin.value() < 0
-                  else self.seed_spin.value()))
-        self.log(f"Running Hi3D 1536: refining {self.stage1_source.name} "
-                 f"with {image.name} (25 steps, geometry only) ...", "info")
+                  else self.seed_spin.value()),
+            start_structure=start_structure)
+        if start_structure is None:
+            self.log(
+                f"Running Hi3D 1536 (1-3 pass): refining "
+                f"{self.stage1_source.name} with {image.name} "
+                f"(25 steps, geometry only) ...", "info")
+        else:
+            self.log(
+                f"Running Hi3D 1536 (3 pass only): voxelizing "
+                f"{self.stage1_source.name} at structure {start_structure} "
+                f"and refining with {image.name} (25 steps, geometry only) "
+                f"...", "info")
+
+    def on_run_cellocut(self):
+        """Watertight-repair the saved Shape-512 mesh with CelloCut."""
+        if (self.worker.generating or self.rmbg.running
+                or self.hi3d.refining or self.cellocut.running):
+            return
+        if self.stage1_state is None or not self.stage1_state.is_file():
+            QMessageBox.information(
+                self, "UniForge3D",
+                "Run a generation with Early stop enabled first; CelloCut "
+                "repairs its saved Shape-512 mesh.")
+            self._refresh_buttons()
+            return
+        if self.stage1_source is None or not self.stage1_source.is_file():
+            QMessageBox.warning(
+                self, "UniForge3D",
+                "The Early stop GLB is missing; run that generation again.")
+            return
+        output_path = _cellocut_output_path(self.stage1_source)
+        state_path = _shape512_state_path(self.stage1_source)
+        # Back up the original Shape-512 state once, before the worker
+        # regenerates it from the repaired mesh.
+        if state_path.is_file():
+            state_backup = state_path.with_name(
+                state_path.name.replace(".shape512.pt",
+                                        "_original.shape512.pt"))
+            if not state_backup.is_file():
+                shutil.copy2(state_path, state_backup)
+                self.log(f"Original Shape-512 state kept as "
+                         f"{state_backup.name}.", "info")
+        # The idle UniForge3D worker keeps its pipeline resident; release it
+        # so the 512^3 UDF rasterization gets the full GPU. It reloads on the
+        # next generation.
+        if self.worker.alive:
+            self.worker.stop()
+            self.log("UniForge3D worker unloaded to free GPU memory for "
+                     "CelloCut.", "info")
+        self._pending_kind = "cellocut"
+        self._pending_state = None
+        self._pending_images = None
+        self.btn_folder.setVisible(False)
+        self._refresh_buttons()
+        self.cellocut.start(self.stage1_source, output_path,
+                            shape512_state=state_path)
+        self.log(f"Running CelloCut watertight repair on "
+                 f"{self.stage1_source.name} (512^3 UDF, graph cut, "
+                 f"geometry only) ...", "info")
+
+    def _on_cellocut_done(self, output: str, seed=None):
+        self._clear_pending_job()
+        repaired = Path(output)
+        target = self.stage1_source
+        if target is None or not target.is_file():
+            self.log("The Shape-512 GLB vanished; keeping the repaired "
+                     f"mesh as {repaired.name}.", "warn")
+            target = repaired.with_name("prediction_512.glb")
+            shutil.copy2(repaired, target)
+            repaired.unlink(missing_ok=True)
+        else:
+            # Replace the stage-1 mesh in place; keep the original once.
+            backup = _cellocut_backup_path(target)
+            if not backup.is_file():
+                shutil.copy2(target, backup)
+                self.log(f"Original mesh kept as {backup.name}.", "info")
+            shutil.copy2(repaired, target)
+            repaired.unlink(missing_ok=True)
+        self.log(f"CelloCut finished; {target.name} now holds the watertight "
+                 "mesh.", "ok")
+        self.last_output = target
+        self.btn_folder.setVisible(True)
+        # Show low / Show high compares the untouched original with the
+        # repaired mesh now stored under the Shape-512 name.
+        backup = _cellocut_backup_path(target)
+        if backup.is_file():
+            self.compare_low = backup
+            self.compare_high = target
+            self.compare_align = None
+            self.log("Show low / Show high is available "
+                     "(original vs watertight).", "ok")
+        else:
+            self.compare_low = None
+            self.compare_high = None
+            self.compare_align = None
+        if self.viewer.load(target, preserve_camera=True,
+                            preserve_material=True):
+            self.log("Reloaded the watertight mesh in the 3D view "
+                     "(camera kept).", "ok")
+        else:
+            self.log("Could not display the repaired mesh in viewer.",
+                     "error")
+        # Publish the repaired OBJ next to the GLB, like every other run.
+        self.converter.convert(target)
+        self._refresh_buttons()
+
+    def _on_cellocut_failed(self, msg: str):
+        self._clear_pending_job()
+        self.log(msg, "error")
+        QMessageBox.warning(self, "CelloCut repair failed", msg)
+        self._refresh_buttons()
 
     def on_generate_texture(self):
         if self.worker.generating or self.rmbg.running or self.hi3d.refining:
@@ -1647,6 +2004,13 @@ class MainWindow(QMainWindow):
         self._pending_images = None
 
     def on_stop(self):
+        if self.cellocut.running:
+            self.cellocut.stop()
+            self._clear_pending_job()
+            self.log("CelloCut repair stopped (worker killed); the 512 "
+                     "mesh is unchanged.", "warn")
+            self._refresh_buttons()
+            return
         if self.hi3d.refining:
             self.hi3d.stop()
             self._clear_pending_job()
@@ -1687,13 +2051,33 @@ class MainWindow(QMainWindow):
             else:
                 self.texture_state = None
                 self.texture_source = None
-            # Offer the low/high toggle when this folder holds both GLBs.
-            high_path = loaded_path.with_name("prediction.glb")
+            # Offer the low/high toggle when this folder holds a pair.
             low_path = loaded_path.with_name("prediction_512.glb")
-            if (loaded_path.name in ("prediction.glb", "prediction_512.glb")
-                    and high_path.is_file() and low_path.is_file()):
-                self.compare_low = low_path
-                self.compare_high = high_path
+            high_path = loaded_path.with_name("prediction.glb")
+            hi3d_path = loaded_path.with_name("prediction_hi3d_1536.glb")
+            original_path = loaded_path.with_name(
+                "prediction_512_original.glb")
+            pair = None
+            if loaded_path.name == "prediction.glb":
+                if low_path.is_file():
+                    pair = (low_path, high_path)
+            elif loaded_path.name == "prediction_hi3d_1536.glb":
+                if low_path.is_file():
+                    pair = (low_path, hi3d_path)
+            elif loaded_path.name == "prediction_512.glb":
+                if original_path.is_file():
+                    # CelloCut replaced the Shape-512 mesh; compare against
+                    # the untouched original.
+                    pair = (original_path, loaded_path)
+                elif high_path.is_file():
+                    pair = (low_path, high_path)
+                elif hi3d_path.is_file():
+                    pair = (low_path, hi3d_path)
+            elif loaded_path.name == "prediction_512_original.glb":
+                if low_path.is_file():
+                    pair = (loaded_path, low_path)
+            if pair is not None:
+                self.compare_low, self.compare_high = pair
                 self.compare_align = None
                 self.log("Show low / Show high is available for this folder.",
                          "ok")
@@ -1730,9 +2114,8 @@ class MainWindow(QMainWindow):
         if self.viewer.load(target, preserve_camera=True,
                             preserve_material=True,
                             align_bounds=self.compare_align):
-            which = ("Shape-512 (low)" if target == self.compare_low
-                     else "Shape-1024 (high)")
-            self.log(f"Showing {which} geometry.", "info")
+            which = "low" if target == self.compare_low else "high"
+            self.log(f"Showing {target.name} ({which}) geometry.", "info")
         else:
             self.log(f"Could not show {target.name}.", "error")
         self._update_compare_button()
@@ -1854,10 +2237,27 @@ class MainWindow(QMainWindow):
                 self._update_seed_button()
         self.last_output = out
         self.btn_folder.setVisible(True)
+        # The Hi3D mesh is recentered/normalized, so align it to the
+        # Shape-512 bounds for the in-place low/high comparison. The saved
+        # GLB keeps Hi3D's own scale; only the viewer is aligned.
+        low = self.stage1_source
+        if low is not None and low.is_file() and low.resolve() != out.resolve():
+            self.compare_low = low
+            self.compare_high = out
+            self.compare_align = viewer_mod.file_bounds(low)
+            align = self.compare_align
+        else:
+            self.compare_low = None
+            self.compare_high = None
+            self.compare_align = None
+            align = None
         self.log("Hi3D recenters the result and normalizes it to unit "
                  "radius; absolute scale is not preserved.", "info")
-        if self.viewer.load(output):
+        if self.viewer.load(output, align_bounds=align):
             self.log(f"Loaded Hi3D result into viewer: {out.name}", "ok")
+            if self.compare_low is not None:
+                self.log("Show low / Show high is available "
+                         "(Shape-512 vs Hi3D 1536).", "ok")
         else:
             self.log("Could not display the Hi3D result in viewer.", "error")
         # Published next to the GLB, like every other completed run.
@@ -1877,6 +2277,7 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         self.rmbg.shutdown()
         self.hi3d.shutdown()
+        self.cellocut.shutdown()
         self.worker.shutdown()
         super().closeEvent(event)
 

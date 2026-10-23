@@ -29,9 +29,20 @@ auto-detects the model tree and applies VRAM safeguards.
 
 ### Hi3D 1536 refinement (optional)
 
-After an **Early stop** run, **Run Hi3D 1536** refines the saved
-`prediction_512.glb` with Hi3D v1.0, conditioned on the image selected as
-**REF** (falling back to that run's first input image).
+After an **Early stop** run, the **Upscale settings** panel appears below the
+UniForge3D settings. Both Hi3D buttons refine the saved `prediction_512.glb`
+with Hi3D v1.0, conditioned on the image selected as **REF** (falling back to
+that run's first input image):
+
+- **Hi3D 1536 (1-3 pass)** runs the full Hi3D ladder: structures 64 → 128 →
+  192, output 1536.
+- **Hi3D 1536 (3 pass only)** voxelizes your saved mesh at structure 192 and
+  runs only the final pass, skipping passes 1-2. It uses your mesh directly
+  in pass 3; the final 1536 decode has the same memory cost as the full run.
+- **Run 2nd stage** stays in the same panel: it runs the UniForge Shape-1024
+  upscale from the saved Shape-512 mesh.
+
+Integration notes:
 
 - Keep the Hi3D v1.0 source checkout at `Hi3Dv1.0/` (or point
   `UNIFORGE_HI3D_SOURCE` at it). It is run directly because its package
@@ -40,9 +51,37 @@ After an **Early stop** run, **Run Hi3D 1536** refines the saved
   (~10.7 GB total) into `models/`.
 - The result is geometry only and is written next to the preview as
   `prediction_hi3d_1536.glb`. Hi3D unloads as soon as refinement finishes.
-- 1536 is GPU-memory intensive. Low VRAM uses sequential CPU offload, but a
-  24–32 GB card may still be limited (Hi3D's 1536 mode was validated on a
+- After refinement, **Show low / Show high** compares the saved Shape-512 mesh
+  with the Hi3D result in place, keeping the current camera and material.
+  Hi3D normalizes its output, so the viewer aligns it to the Shape-512 bounds
+  for the comparison; the saved GLB keeps Hi3D's own scale.
+- Hi3D's decoder in this checkout is patched for lower peak VRAM: group norms,
+  Swish and the unpooling projection run in bounded chunks, residual adds are
+  in-place during inference, and decoder caches/features are released before
+  mesh extraction and hole filling.
+- 1536 is still GPU-memory intensive. Low VRAM uses sequential CPU offload,
+  but a 24–32 GB card may remain limited (Hi3D's 1536 mode was validated on a
   96 GB GPU).
+
+### CelloCut watertight repair (optional)
+
+After an **Early stop** run, **Run CelloCut (watertight)** in the
+**Upscale settings** panel repairs the saved `prediction_512.glb` with
+CelloCut (vendored under `CelloCut/`): it rebuilds the mesh from a 512³
+unsigned-distance volume, tetrahedralizes it, and solves a graph-cut cell
+labeling, which yields a strictly watertight solid (holes, self-intersections
+and non-manifold edges included). Notes:
+
+- Constructive method — **no model download**; the GPU is only used for the
+  512³ UDF rasterization. The two compiled extensions ship as local wheels in
+  `.whl/` (`torchcumesh2sdf`, `cppmodules`), installed by `install.bat`.
+- The repaired mesh **replaces `prediction_512.glb` in place** and the 3D
+  view reloads it; the untouched original is kept once as
+  `prediction_512_original.glb`. Its `prediction_512.shape512.pt` state is
+  regenerated from the repaired mesh (original kept as
+  `prediction_512_original.shape512.pt`), so **Run 2nd stage** and the Hi3D
+  buttons then start from the repaired geometry, and
+  **Show low / Show high** compares original vs watertight.
 
 ## Credits & License
 

@@ -16,6 +16,9 @@ rem                 briaai/RMBG-2.0
 rem
 rem Hi3D v1.0 adds about 10.7 GB. Existing files are skipped on rerun.
 rem
+rem CelloCut (Run CelloCut watertight button) needs NO model download; it
+rem ships as compiled wheels in .whl\ installed by install.bat.
+rem
 rem No models\hf_cache is created: files are fetched directly.
 rem
 rem Usage:

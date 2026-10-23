@@ -16,6 +16,21 @@ from sparc3d.ops import sparse_backend
 from sparc3d.utils.misc import batch2offset, deep_clone, offset2batch
 from sparc3d.utils.serialization import encode
 
+_ACTIVATION_CHUNK_ELEMENTS = 16 * 1024 * 1024
+"""Feature elements activated in place per chunk (about 64 MB in float32)."""
+
+_DERIVED_KEYS = (
+    "sparse_conv_feat",
+    "serialized_order",
+    "serialized_inverse",
+    "pad",
+    "unpad",
+    "cu_seqlens_key",
+)
+"""Representations rebuilt on demand from coordinates and features. A clone lowers
+its own flags in :meth:`Point.initialization`, so carrying these across would only
+keep large index arrays alive until the next resampling stage."""
+
 
 class AttrDict(dict):
     """Dict whose keys are also readable and writable as attributes."""
@@ -219,13 +234,33 @@ class Point(AttrDict):
         return self._get_attrs(feat, ["sdf", "deform"])
 
     def activate(self) -> None:
-        """Apply each attribute's activation to its channels of ``feat``, in place."""
+        """Apply each attribute's activation to its channels of ``feat``, in place.
+
+        The decoded point can hold millions of rows, so the inference path writes
+        each activation back into its existing channel range chunk by chunk rather
+        than allocating the per-attribute results and a concatenated copy. Training
+        keeps the out-of-place construction.
+        """
         layout = self.get_layout()
-        activated_feat = []
+        feat = self["feat"]
+        if not layout:
+            return
+        if torch.is_grad_enabled() and feat.requires_grad:
+            activated_feat = []
+            for key, entry in layout.items():
+                attr = self.get_attr_from_feat(feat, layout, key)
+                activated_feat.append(entry["act"](attr))
+            self.update_feat(torch.cat(activated_feat, dim=-1))
+            return
+
+        rows = max(1, _ACTIVATION_CHUNK_ELEMENTS // max(feat.shape[-1], 1))
         for key, entry in layout.items():
-            feat = self.get_attr_from_feat(self["feat"], layout, key)
-            activated_feat.append(entry["act"](feat))
-        self.update_feat(torch.cat(activated_feat, dim=-1))
+            attr = self.get_attr_from_feat(feat, layout, key)
+            if attr is None:
+                continue
+            for start in range(0, feat.shape[0], rows):
+                chunk = attr[start:start + rows]
+                chunk.copy_(entry["act"](chunk))
 
     @staticmethod
     def get_attr_from_feat(
@@ -264,14 +299,14 @@ class Point(AttrDict):
     def clone(self, **kwargs: Any) -> "Point":
         """Return an initialized copy, with ``kwargs`` replacing same-named entries.
 
-        Tensors are shared rather than copied (see :func:`~sparc3d.utils.misc.deep_clone`)
-        and the sparse-convolution view is dropped so the clone can re-derive it.
+        Tensors are shared rather than copied (see :func:`~sparc3d.utils.misc.deep_clone`).
+        Derived representations (the sparse-convolution view, serialization orders,
+        and attention padding maps) are dropped so the clone re-derives them against
+        its new coordinates instead of retaining stale full-size index arrays.
         """
         point = Point()
         for key, value in self.items():
-            if key in kwargs:
-                continue
-            if key == "sparse_conv_feat":
+            if key in kwargs or key in _DERIVED_KEYS:
                 continue
             point[key] = deep_clone(value)
         point.update(kwargs)

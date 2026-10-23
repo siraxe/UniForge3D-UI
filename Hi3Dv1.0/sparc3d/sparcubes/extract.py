@@ -17,7 +17,7 @@ def _extractor(device: torch.device) -> FlexiCubes:
     return FlexiCubes(device=device)
 
 
-def point_to_mesh(point: Point) -> Mesh:
+def point_to_mesh(point: Point, *, release_point: bool = False) -> Mesh:
     """Extract a triangle mesh from a decoded, activated ``Point``.
 
     Expects the point's ``feat`` to hold per-corner SDF and deformation channels, as
@@ -27,6 +27,10 @@ def point_to_mesh(point: Point) -> Mesh:
 
     Args:
         point: Single-batch decoded point cloud.
+        release_point: Drop the point's feature, sign, coordinate and sparse views
+            once the extraction copies exist. The caller must not reuse the point.
+            The pipeline uses this to free the decoder's largest tensors before
+            hole filling.
 
     Returns:
         Mesh in the point's normalized coordinate frame. ``Mesh.success`` is ``False``
@@ -49,12 +53,21 @@ def point_to_mesh(point: Point) -> Mesh:
     feat = feat[order]
     grid_coord = grid_coord[order]
 
-    vert_feat, vert_layouts = point.get_vert_feat(feat)
-
     # Carry the sign logits through the corner-to-vertex averaging as an extra channel.
     has_sdf_sign = "sdf_sign" in point
     if has_sdf_sign:
         sdf_sign = torch.sigmoid(point.sdf_sign).unsqueeze(2)[order]
+    del index, order
+
+    if release_point:
+        # ``feat``, ``sdf_sign`` and the sparse view deliberately share one backing
+        # store, so every reference has to go before the large base is released.
+        for key in ("feat", "grid_coord", "sdf_sign", "sparse_conv_feat"):
+            point.pop(key, None)
+        point.is_sparsified = False
+
+    vert_feat, vert_layouts = point.get_vert_feat(feat)
+    if has_sdf_sign:
         vert_feat = torch.cat([sdf_sign, vert_feat], dim=2)
 
     vert_coord, vert_feat, cubes = sparse_cube2verts(grid_coord, vert_feat)

@@ -9,11 +9,18 @@ UniForge3D worker for VRAM.
 The protocol is the same JSON-lines format used by worker.py:
 
   stdin:  {"cmd": "refine", "image": ..., "coarse_mesh": ..., "output": ...,
-           "resolution": 1536, "steps": 25, "seed": 0}
+           "resolution": 1536, "steps": 25, "seed": 0,
+           "start_structure": 192}   # optional; omit for the full ladder
   stdout: {"type": "ready"}
           {"type": "log", "msg": ..., "level": "info"|"ok"|"warn"|"error"}
           {"type": "done", "output": "...", "seed": 42, "resolution": 1536}
           {"type": "error", "msg": "..."}
+
+Without ``start_structure`` the full Hi3D ladder runs (structures 64, 128,
+192). With ``start_structure`` 192, the worker voxelizes the supplied mesh at
+that rung and runs only the final pass: passes 1-2 are skipped and the source
+mesh is used directly. A CUDA OOM triggers one retry with reduced token
+budgets for the later passes.
 
 Hi3D is geometry-only. Pass a reference image with its alpha preserved so
 ``prepare_image`` can frame the subject the way the conditioner expects.
@@ -74,15 +81,38 @@ def _run_refine(pipeline, cmd: dict) -> None:
     steps = int(cmd.get("steps") or 0)
     num_steps = steps if steps > 0 else 25
     seed = _resolve_seed(cmd)
+    start_structure = cmd.get("start_structure")
 
     if not image_path.is_file():
         raise FileNotFoundError(f"reference image not found: {image_path}")
     if not coarse_path.is_file():
         raise FileNotFoundError(f"1st-stage mesh not found: {coarse_path}")
 
+    if start_structure is not None:
+        from sparc3d.pipelines.sparc3d_pipeline import (
+            PASS_BUDGETS,
+            STRUCTURE_RESOLUTIONS,
+        )
+        from sparc3d.ops import adaptive_vox
+        from sparc3d.sparcubes.postprocess import validate_mesh
+
+        start_structure = int(start_structure)
+        if start_structure not in STRUCTURE_RESOLUTIONS:
+            raise ValueError(
+                f"start_structure must be one of {STRUCTURE_RESOLUTIONS}, "
+                f"got {start_structure}")
+        start_index = STRUCTURE_RESOLUTIONS.index(start_structure)
+        mode_label = (
+            f"pass {start_index + 1}/{len(STRUCTURE_RESOLUTIONS)} only, "
+            f"structure {start_structure}")
+        if start_index > 0:
+            mode_label += " (earlier passes skipped)"
+    else:
+        mode_label = "full ladder (structures 64, 128, 192)"
+
     emit({"type": "log", "msg": (
-        f"Hi3D settings: resolution={resolution}, steps={num_steps}, "
-        f"seed={seed}")})
+        f"Hi3D settings: {mode_label}, resolution={resolution}, "
+        f"steps={num_steps}, seed={seed}")})
     emit({"type": "log", "msg": (
         f"Refining {coarse_path.name} with {image_path.name} "
         f"(image-conditioned, geometry only) ...")})
@@ -91,13 +121,52 @@ def _run_refine(pipeline, cmd: dict) -> None:
         image = image.copy()
     coarse_mesh = trimesh.load(str(coarse_path), force="mesh", process=False)
 
-    result = pipeline(
-        image,
-        coarse_mesh,
-        resolution=resolution,
-        num_inference_steps=num_steps,
-        seed=seed,
-    )
+    if start_structure is None:
+        result = pipeline(
+            image,
+            coarse_mesh,
+            resolution=resolution,
+            num_inference_steps=num_steps,
+            seed=seed,
+        )
+    else:
+        # Start the ladder at the requested rung using this mesh directly: the
+        # first two passes never run, so their refined geometry is not involved.
+        if start_index > 0 and hasattr(pipeline, "transformer_512"):
+            # The 64-structure transformer is unused when the ladder starts
+            # later. Release it so its ~3.5 GB cannot sit in VRAM next to the
+            # memory-intensive 1536 decode (full-GPU mode especially).
+            import gc
+
+            import torch
+
+            del pipeline.transformer_512
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            emit({"type": "log", "msg": (
+                "Released the 64-structure transformer (not used by "
+                "pass 3).")})
+        mesh = validate_mesh(coarse_mesh)
+        coords = adaptive_vox(
+            mesh,
+            resolution=start_structure,
+            target_num=PASS_BUDGETS[start_index],
+            device=pipeline.device,
+        )
+        skipped = (f"Skipping passes 1-{start_index}."
+                   if start_index > 0 else "No earlier passes to skip.")
+        emit({"type": "log", "msg": (
+            f"Voxelized the source mesh at structure {start_structure}: "
+            f"{coords.shape[0]:,} occupied voxels. {skipped}")})
+        result = pipeline.refine_voxels(
+            image,
+            coords,
+            structure_resolution=start_structure,
+            resolution=resolution,
+            num_inference_steps=num_steps,
+            seed=seed,
+        )
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     result.mesh.export(str(output_path))
@@ -173,8 +242,7 @@ def main() -> int:
     try:
         def progress(event):
             emit({"type": "log", "msg": (
-                f"Hi3D pass {event.pass_index + 1}/{event.num_passes} "
-                f"(structure {event.structure_resolution}): step "
+                f"Hi3D structure {event.structure_resolution}: step "
                 f"{event.step}/{event.num_inference_steps}")})
 
         pipeline = Sparc3DPipeline.from_pretrained(
@@ -210,7 +278,31 @@ def main() -> int:
                   "msg": f"Unknown command: {cmd.get('cmd')!r}"})
             continue
         try:
-            _run_refine(pipeline, cmd)
+            try:
+                _run_refine(pipeline, cmd)
+            except RuntimeError as ex:
+                if "out of memory" not in str(ex).lower():
+                    raise
+                # Last-resort fallback for smaller cards: retry once with fewer
+                # occupied voxels in the later passes. The decode's feature count
+                # scales with those budgets, so this is the one safe knob left
+                # after the decoder's chunking/in-place optimizations.
+                import sparc3d.pipelines.sparc3d_pipeline as pipeline_module
+
+                emit({"type": "log", "msg": (
+                    "CUDA out of memory during Hi3D refinement; retrying once "
+                    "with reduced occupied-voxel budgets for the later "
+                    "passes."), "level": "warn"})
+                torch.cuda.empty_cache()
+                budgets = pipeline_module.PASS_BUDGETS
+                pipeline_module.PASS_BUDGETS = tuple(
+                    budget if index == 0 else max(1, int(budget * 0.65))
+                    for index, budget in enumerate(budgets)
+                )
+                emit({"type": "log", "msg": (
+                    f"Retry budgets: {pipeline_module.PASS_BUDGETS[1:]} "
+                    "(was " + ", ".join(str(b) for b in budgets[1:]) + ")")})
+                _run_refine(pipeline, cmd)
         except Exception as ex:  # noqa: BLE001 - keep the process exit clean
             message = f"Hi3D refinement failed: {ex}"
             if "out of memory" in message.lower():

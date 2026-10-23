@@ -43,17 +43,40 @@ Deliberately the same number as ``pipelines.sparc3d_pipeline.DECODE_FEATURE_CEIL
 but a different policy: this one degrades a single block, while the pipeline raises
 when a *completed* decode is too large to feed another pass."""
 
-_GROUP_NORM_SPLIT = 8
-"""Groups normalized per iteration. Group statistics are independent, so this only
-bounds the temporaries, not the result."""
+_NORM_CHUNK_ELEMENTS = 16 * 1024 * 1024
+"""Feature elements normalized per chunk (about 64 MB in float32). Moments are
+accumulated in a first pass and applied in a second, so the per-chunk temporaries
+stay bounded instead of materializing a second full-resolution feature copy."""
+
+_ACTIVATION_CHUNK_ELEMENTS = 16 * 1024 * 1024
+"""Feature elements activated in place per chunk (about 64 MB in float32)."""
+
+_UNPOOL_CHUNK_ELEMENTS = 64 * 1024 * 1024
+"""Elements in one chunk of the ``[rows, 8 * channels]`` unpooling projection
+(about 256 MB in float32). The untruncated projection is the decoder's largest
+single transient: at several million points it is multiple GB."""
 
 
 class Swish(nn.Module):
-    """``x * sigmoid(x)``."""
+    """``x * sigmoid(x)``, with a chunked in-place path for inference."""
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Apply the Swish activation elementwise."""
-        return x * torch.sigmoid(x)
+        """Apply the Swish activation elementwise.
+
+        Decoding is dominated by full-resolution feature tensors, and every norm is
+        followed by a Swish. Under inference mode there is no autograd history to
+        preserve, so the activation is written back into ``x`` chunk by chunk: the
+        largest transient is one chunk rather than a second tensor the size of the
+        point cloud. Training keeps the out-of-place expression.
+        """
+        if x.requires_grad or x.numel() == 0 or not x.is_contiguous():
+            return x * torch.sigmoid(x)
+
+        rows = max(1, _ACTIVATION_CHUNK_ELEMENTS // max(x.shape[-1], 1))
+        for start in range(0, x.shape[0], rows):
+            chunk = x[start:start + rows]
+            chunk.mul_(torch.sigmoid(chunk))
+        return x
 
 
 class PointGroupNorm(PointModule):
@@ -65,6 +88,7 @@ class PointGroupNorm(PointModule):
         group: int = 32,
         min_group_channels: int = 4,
         eps: float = 1e-6,
+        in_place: bool = False,
     ):
         """
         Args:
@@ -73,6 +97,10 @@ class PointGroupNorm(PointModule):
                 to give every group ``min_group_channels`` channels.
             min_group_channels: Minimum channels per group.
             eps: Variance floor.
+            in_place: Write the normalized features back into the input tensor
+                instead of allocating a second full-resolution copy. Only safe when
+                no caller still aliases the input features; the residual block and
+                output head opt in where that holds.
 
         Raises:
             ValueError: ``channels`` is not divisible by the resolved group count.
@@ -82,6 +110,7 @@ class PointGroupNorm(PointModule):
         self.group = group
         self.channels = channels
         self.min_group_channels = min_group_channels
+        self.in_place = in_place
 
         if self.min_group_channels * self.group > channels:
             self.group = channels // self.min_group_channels
@@ -98,45 +127,57 @@ class PointGroupNorm(PointModule):
     def forward(self, point: Point) -> Point:
         """Normalize ``point.feat`` per batch element and group, in float32."""
         feat = point.feat
-        batch = point.batch.detach().clone()
+        batch = point.batch
         N, C = feat.shape
         B = int(batch[-1] + 1)
 
         G = self.group
         CP = self.channels_per_group
         feat_group = feat.view(N, G, CP)
-        feat_norm_all = feat.new_zeros((N, G, CP))
+        rows = max(1, _NORM_CHUNK_ELEMENTS // C)
 
-        for start in range(0, G, _GROUP_NORM_SPLIT):
-            end = min(start + _GROUP_NORM_SPLIT, G)
+        # First pass: per-(batch, group) moments. Point chunks bound both the
+        # squared-feature temporary and the row indices used by index_add_.
+        sums = feat.new_zeros((B, G))
+        sums_sq = feat.new_zeros((B, G))
+        for start in range(0, N, rows):
+            stop = min(start + rows, N)
+            chunk = feat_group[start:stop]
+            batch_idx = batch[start:stop].long()
+            sums.index_add_(0, batch_idx, chunk.sum(dim=2))
+            sums_sq.index_add_(0, batch_idx, chunk.square().sum(dim=2))
+            del chunk
 
-            feat_slice = feat_group[:, start:end, :]
-            sum_feat = feat_slice.sum(dim=2)
-            sum_feat_sq = feat_slice.square().sum(dim=2)
+        counts = torch.bincount(batch, minlength=B).float().view(B, 1) * CP
+        mean = sums.div_(counts + self.eps)
+        var = sums_sq.div_(counts + self.eps).sub_(mean.square())
+        inv_std = torch.rsqrt(var + self.eps)
 
-            # Per-(batch, group) moments, accumulated over the points of each element.
-            batch_idx = batch.view(-1, 1).expand(-1, end - start).long()
-            sums = feat.new_zeros((B, end - start)).scatter_add(0, batch_idx, sum_feat)
-            sums_sq = feat.new_zeros((B, end - start)).scatter_add(
-                0, batch_idx, sum_feat_sq
-            )
+        # Second pass: apply the moments. The output normally owns a new tensor;
+        # in-place callers write into ``feat`` itself, which saves one full copy at
+        # the resolutions where the decoder peaks.
+        in_place = self.in_place and not (
+            torch.is_grad_enabled() and feat.requires_grad
+        )
+        out = feat_group if in_place else feat.new_empty((N, G, CP))
+        for start in range(0, N, rows):
+            stop = min(start + rows, N)
+            chunk = out[start:stop]
+            if not in_place:
+                chunk.copy_(feat_group[start:stop])
+            batch_idx = batch[start:stop]
+            mean_chunk = mean.index_select(0, batch_idx).unsqueeze(2)
+            inv_std_chunk = inv_std.index_select(0, batch_idx).unsqueeze(2)
+            chunk.sub_(mean_chunk).mul_(inv_std_chunk)
+            del chunk, mean_chunk, inv_std_chunk
 
-            counts = torch.bincount(batch, minlength=B).float().view(B, 1) * CP
-            mean = sums.div_(counts + self.eps)
-            var = sums_sq.div_(counts + self.eps).sub_(mean.square())
-            inv_std = torch.rsqrt(var + self.eps)
+        if in_place:
+            feat.mul_(self.weights).add_(self.bias)
+            return point
 
-            mean_exp = mean.index_select(0, batch).unsqueeze(2)
-            inv_std_exp = inv_std.index_select(0, batch).unsqueeze(2)
-            feat_norm_all[:, start:end, :] = feat_slice.sub(mean_exp).mul_(inv_std_exp)
-
-            del feat_slice, sum_feat, sum_feat_sq, sums, sums_sq
-            del mean, var, inv_std, mean_exp, inv_std_exp
-
-        feat_norm_all = feat_norm_all.view(N, C)
-        feat_norm_all.mul_(self.weights).add_(self.bias)
-
-        point.update_feat(feat_norm_all)
+        out = out.view(N, C)
+        out.mul_(self.weights).add_(self.bias)
+        point.update_feat(out)
         return point
 
 
@@ -188,6 +229,9 @@ class SparseClsHead(PointModule):
             out_channels: Logits emitted per voxel; eight for octree occupancy.
         """
         super().__init__()
+        # The head aliases the caller's features, which the caller still needs
+        # (unpooling projects them after the occupancy prediction), so the norm
+        # must not write back in place.
         self.fc = PointSequential(
             PointGroupNorm(in_channels),
             Swish(),
@@ -222,8 +266,10 @@ class ConvOut(PointModule):
             out_channels: Output channels, the first eight being the SDF sign logits.
         """
         super().__init__()
+        # The decoder output has no residual or other alias of its input feature
+        # tensor, so the final, largest normalization can write back in place.
         self.conv = PointSequential(
-            PointGroupNorm(in_channels),
+            PointGroupNorm(in_channels, in_place=True),
             Swish(),
             sparse_backend.Conv3d(
                 in_channels,
@@ -284,13 +330,18 @@ class SparseResnetBlock(PointModule):
         """
         super().__init__()
         self.skip_points = skip_points
+        # When the residual is projected, forward() computes that projection before
+        # entering the block, so the first norm may normalize its input in place.
+        # When channels match, the shortcut aliases point.feat and the norm must
+        # allocate a separate output. The second norm always consumes the first
+        # convolution's fresh output, so it can run in place in either case.
         self.block = PointSequential(
-            PointGroupNorm(in_channels),
+            PointGroupNorm(in_channels, in_place=in_channels != out_channels),
             Swish(),
             sparse_backend.Conv3d(
                 in_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=True
             ),
-            PointGroupNorm(out_channels),
+            PointGroupNorm(out_channels, in_place=True),
             Swish(),
             sparse_backend.Conv3d(
                 out_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=True
@@ -317,7 +368,15 @@ class SparseResnetBlock(PointModule):
             shortcut = self.res_conv(point.feat)
         else:
             shortcut = point.feat
-        point.update_feat(shortcut + self.block(point).feat)
+        branch = self.block(point).feat
+        # Inference has no autograd history, so accumulating into the shortcut
+        # avoids a third full-resolution tensor; training keeps the out-of-place
+        # sum. (The branch is dead once it has been folded in either way.)
+        if torch.is_grad_enabled() and (shortcut.requires_grad or branch.requires_grad):
+            point.update_feat(shortcut + branch)
+        else:
+            shortcut.add_(branch)
+            point.update_feat(shortcut)
         return point
 
 
@@ -535,16 +594,53 @@ class SerializedUnpooling(PointModule):
 
     def forward(self, point: Point) -> Point:
         """Split each voxel into eight children and keep the ones predicted occupied."""
-        feat = self.proj(point.feat)
         pred_octree = self.cls_head(point).feat
+        n = point.feat.shape[0]
+        c = self.proj.out_features // 8
 
-        m, c = feat.shape[0], feat.shape[1] // 8
-        mask = pred_octree.flatten() > 0
+        # occupancy[8 * i + j] selects child j of point i, the same row order as
+        # ``feat.view(n * 8, c)`` and ``grid_coord.view(n * 8, 3)`` below.
+        occupancy = pred_octree.reshape(n * 8) > 0
+        kept = int(occupancy.sum().item())
 
-        feat = feat.view(m * 8, c)[mask]
-        grid_coord = point.grid_coord.unsqueeze(1) * 2 + self.inv_grid_coord.unsqueeze(0)
-        grid_coord = grid_coord.view(-1, 3)[mask]
-        batch = point.batch.unsqueeze(1).expand(-1, 8).flatten()[mask]
+        feat = point.feat.new_empty((kept, c))
+        grid_coord = point.grid_coord.new_empty((kept, 3))
+        batch = point.batch.new_empty((kept,))
+
+        # Projecting all eight children at once allocates ``n * 8 * c`` features,
+        # which is several GB at the last doubling. Project and select one bounded
+        # chunk at a time instead; the retained rows are the same.
+        rows = max(1, _UNPOOL_CHUNK_ELEMENTS // (8 * max(c, 1)))
+        offset = 0
+        for start in range(0, n, rows):
+            stop = min(start + rows, n)
+            keep = occupancy[start * 8:stop * 8]
+            selected = int(keep.sum().item())
+            if selected == 0:
+                continue
+
+            projected = torch.nn.functional.linear(
+                point.feat[start:stop], self.proj.weight
+            )
+            feat[offset:offset + selected] = projected.view(-1, c)[keep]
+
+            children = (
+                point.grid_coord[start:stop].unsqueeze(1) * 2
+                + self.inv_grid_coord.unsqueeze(0)
+            )
+            grid_coord[offset:offset + selected] = children.view(-1, 3)[keep]
+
+            batch_chunk = (
+                point.batch[start:stop].unsqueeze(1).expand(-1, 8).reshape(-1)
+            )
+            batch[offset:offset + selected] = batch_chunk[keep]
+            offset += selected
+            del projected, children, batch_chunk
+
+        if offset != kept:
+            raise RuntimeError(
+                f"unpooling selected {offset} children but allocated {kept}"
+            )
 
         point = point.clone(
             feat=feat,
