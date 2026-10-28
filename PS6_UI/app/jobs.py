@@ -169,9 +169,11 @@ class JobCoordinator(QObject):
         self.clear_pending()
         self.generation_failed.emit(msg)
 
-    def _on_hi3d_done(self, output, seed=None):
+    def _on_hi3d_done(self, output, seed=None, extra=None):
         self.clear_pending()
-        self.hi3d_done.emit({"output": Path(output), "seed": seed})
+        self.hi3d_done.emit({
+            "output": Path(output), "seed": seed, "scale_back": extra,
+        })
 
     def _on_hi3d_failed(self, msg: str):
         self.clear_pending()

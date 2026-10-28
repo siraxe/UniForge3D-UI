@@ -112,6 +112,58 @@ def scale_back_info(
     }
 
 
+def radial_scale_back_info(
+    source_vertices,
+    *,
+    scale_tolerance: float = SCALE_TOLERANCE,
+    translation_tolerance: float = TRANSLATION_TOLERANCE,
+) -> dict:
+    """Build the inverse of Hi3D's output normalization for a source mesh.
+
+    Hi3D's postprocess subtracts the decoded mesh's vertex mean and divides by
+    its maximum radial norm.  Mapping the result back to *source_vertices*'
+    mean and maximum radius restores the displayed model's size/location::
+
+        v_out = v_hi3d * source_max_radius + source_vertex_mean
+
+    The returned dict matches :func:`scale_back_info`, so
+    :func:`scale_back_arrays` can apply it unchanged.
+    """
+    v = np.asarray(source_vertices, dtype=np.float64)
+    if (v.ndim != 2 or v.shape[1] != 3 or len(v) == 0
+            or not np.isfinite(v).all()):
+        raise ValueError("source_vertices must be a nonempty finite (N, 3) array")
+
+    center = v.mean(axis=0)
+    radius = float(np.linalg.norm(v - center, axis=1).max())
+    if not np.isfinite(radius) or radius <= 0.0:
+        raise ValueError("source mesh has degenerate radial extent")
+
+    bounds = np.stack([v.min(axis=0), v.max(axis=0)])
+    source_longest = float(np.ptp(bounds, axis=0).max())
+    uniform_scale = 1.0 / radius
+    # center_model is stored as the inverse display transform D^-1(center);
+    # scale_back_arrays turns it back into translation_display.
+    center_model = [float(center[0]), float(-center[2]), float(center[1])]
+    scale_change = abs(uniform_scale - 1.0)
+    translation_relative = float(
+        np.linalg.norm(center) / max(source_longest, 1e-12))
+    return {
+        "scaled": bool(scale_change > scale_tolerance
+                       or translation_relative > translation_tolerance),
+        "uniform_scale": float(uniform_scale),
+        "scale_back_factor": float(radius),
+        "center_model": center_model,
+        "translation_display": [float(value) for value in center],
+        "target_max_side": float(source_longest),
+        "source_longest_side": float(source_longest),
+        "scale_change": float(scale_change),
+        "translation_relative": float(translation_relative),
+        "scale_tolerance": float(scale_tolerance),
+        "translation_tolerance": float(translation_tolerance),
+    }
+
+
 def scale_back_arrays(
     vertices,
     faces,

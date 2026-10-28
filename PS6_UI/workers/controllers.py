@@ -242,7 +242,7 @@ class WorkerController(QObject):
 class Hi3DController(QObject):
     log_line = Signal(str, str)
     state_changed = Signal(bool)         # True while refining
-    refine_done = Signal(str, object)    # output path, seed used
+    refine_done = Signal(str, object, object)    # output path, seed, extras
     refine_failed = Signal(str)
 
     def __init__(self, parent=None):
@@ -344,7 +344,9 @@ class Hi3DController(QObject):
     def _on_done(self, output: str, seed=None, extra=None):
         self._refining = False
         self.state_changed.emit(False)
-        self.refine_done.emit(output, seed)
+        # ``extra`` carries the worker's scale_back payload (Hi3D output is
+        # unit-radius); forward it so the UI can restore the source size.
+        self.refine_done.emit(output, seed, extra)
 
     def _on_failed(self, msg: str):
         self._refining = False

@@ -13,7 +13,8 @@ The protocol is the same JSON-lines format used by worker.py:
            "start_structure": 192}   # optional; omit for the full ladder
   stdout: {"type": "ready"}
           {"type": "log", "msg": ..., "level": "info"|"ok"|"warn"|"error"}
-          {"type": "done", "output": "...", "seed": 42, "resolution": 1536}
+          {"type": "done", "output": "...", "seed": 42, "resolution": 1536,
+           "scale_back": {...}}       # inverse of Hi3D's unit normalization
           {"type": "error", "msg": "..."}
 
 Without ``start_structure`` the full Hi3D ladder runs (structures 64, 128,
@@ -34,6 +35,8 @@ import sys
 from pathlib import Path
 
 APP_DIR = Path(__file__).resolve().parent.parent    # PS6_UI
+ROOT = APP_DIR.parent                               # repo root
+sys.path.insert(0, str(ROOT))                       # tools/
 sys.path.insert(0, str(APP_DIR))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -199,13 +202,27 @@ def _run_refine(pipeline, cmd: dict) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     result.mesh.export(str(output_path))
 
+    # Hi3D recenters its output on the decoded mesh's vertex mean and scales
+    # it to unit maximum radius. Report the inverse of that normalization so
+    # the UI can put the result back at the source mesh's size/location, the
+    # same way the 2nd-stage scale-back works.
+    scale_back = None
+    try:
+        from tools._loader import load_tool
+
+        scale_back = load_tool("mesh_edit").radial_scale_back_info(
+            coarse_mesh.vertices)
+    except Exception as error:  # noqa: BLE001 - optional UI convenience
+        emit({"type": "log", "msg": f"Scale-back detection failed: {error}",
+              "level": "warn"})
+
     emit({"type": "log", "msg": (
         f"Hi3D refinement finished at {result.resolution}; "
         f"{len(result.mesh.faces):,} faces, {len(result.mesh.vertices):,} "
         f"vertices."), "level": "ok"})
     emit({"type": "log", "msg": f"Saved {output_path}", "level": "ok"})
     emit({"type": "done", "output": str(output_path), "seed": seed,
-          "resolution": int(result.resolution)})
+          "resolution": int(result.resolution), "scale_back": scale_back})
 
 
 def main() -> int:

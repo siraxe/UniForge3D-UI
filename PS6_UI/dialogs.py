@@ -103,15 +103,14 @@ class SettingsDialog(QDialog):
 
         box = QGroupBox("Generation")
         box_layout = QVBoxLayout(box)
-        self.stage2_rescale = QCheckBox("Uniforge 2nd stage Rescale")
+        self.stage2_rescale = QCheckBox("Auto-rescale 2nd stage and Hi3D")
         self.stage2_rescale.setChecked(stage2_rescale_enabled())
         self.stage2_rescale.setToolTip(
-            "Auto-rescale after 2nd stage")
+            "Restore the source size/location after 2nd stage and Hi3D")
         box_layout.addWidget(self.stage2_rescale)
         hint = QLabel(
-            "Turn this off to keep the raw canonical-cube output of the 2nd "
-            "stage (the old Scale back button behaviour is not available "
-            "then).")
+            "Turn this off to keep the raw canonical-cube / unit-radius "
+            "output of the 2nd stage and Hi3D.")
         hint.setWordWrap(True)
         hint.setStyleSheet("color: #888c92; font-size: 10px;")
         box_layout.addWidget(hint)

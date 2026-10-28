@@ -52,17 +52,19 @@ and save their results next to it.
         128; <strong>1</strong>/<strong>2</strong>/<strong>3</strong> run one
         rung (512/1024/1536).</li>
         <li>Saved as <code>&lt;model&gt;_hi3d_&lt;resolution&gt;.glb</code>;
-        geometry only. <strong>Run 2nd stage</strong> upscales the displayed
-        mesh to 1024, using its <code>.shape512.pt</code> state when
-        present.</li>
+        geometry only. Hi3D normalizes its result to unit radius; with
+        <strong>Auto-rescale</strong> on (Settings, shared with the 2nd stage)
+        the source size/location is restored in place.
+        <strong>Run 2nd stage</strong> upscales the displayed mesh to 1024,
+        using its <code>.shape512.pt</code> state when present.</li>
         <li>Knobs: <strong>Steps</strong> (default 25),
         <strong>Voxel budget</strong> (100% = 80k/90k/110k) and
         <strong>Full GPU</strong> (faster, much higher VRAM; otherwise
         follows Low VRAM).</li>
         <li>Uses <code>submodules/Hi3Dv1.0/</code> or
         <code>UNIFORGE_HI3D_SOURCE</code>; <code>get_models.bat</code>
-        downloads ~10.7 GB (Hi3D + DINOv2 + CLIP). Output is unit-normalized,
-        and 1536 remains VRAM-heavy.</li>
+        downloads ~10.7 GB (Hi3D + DINOv2 + CLIP). Auto-rescale restores the
+        source size/location by default; 1536 remains VRAM-heavy.</li>
       </ul>
     </td>
     <td width="50%" valign="top">
@@ -89,8 +91,9 @@ and save their results next to it.
         <li><strong>Run LATO.2</strong> retopologizes the displayed mesh with
         <a href="https://github.com/LoHhhha/LATO.2">LATO.2</a> (V-Flow +
         T-Flow) at a target vertex count.</li>
-        <li>Saves <code>&lt;model&gt;_lato2.glb</code> plus
-        <code>&lt;model&gt;_lato2.shape512.pt</code>; geometry only.
+        <li>Saves <code>&lt;model&gt;_lato_&lt;verts&gt;.glb</code> plus
+        <code>&lt;model&gt;_lato_&lt;verts&gt;.shape512.pt</code> (the target
+        count from the panel); geometry only.
         The source lives in <code>submodules/LATO.2</code>;
         <code>get_models.bat</code> fetches its checkpoints.</li>
         <li>The <code>Remesh_LATO2:</code> panel has
@@ -101,9 +104,10 @@ and save their results next to it.
     <td width="50%" valign="top">
       <ul>
         <li><strong>Open folder</strong> fills the Outliner with every
-        <code>*.glb</code>; click to display it in place (camera and material
-        kept). Derived models nest under their base, and the arrow on any row
-        collapses its branch.</li>
+        <code>*.glb</code> plus any <code>*.obj</code> that has no same-stem
+        GLB; click to display it in place (camera and material kept). Derived
+        models nest under their base, and the arrow on any row collapses its
+        branch.</li>
         <li>Right-click: <strong>Rename...</strong>, <strong>Show obj</strong>
         (selects the matching <code>.obj</code> in Explorer),
         <strong>Duplicate</strong>, <strong>Delete</strong>. Middle-click

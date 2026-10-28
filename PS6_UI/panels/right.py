@@ -320,7 +320,7 @@ class RightPanel(QWidget):
         layout = accordion_section(root, "Remesh_LATO2:")
 
         self.lato2_verts = QSpinBox()
-        self.lato2_verts.setRange(200, 5000)
+        self.lato2_verts.setRange(100, 5000)
         self.lato2_verts.setSingleStep(100)
         self.lato2_verts.setValue(2000)
         self.lato2_verts.setMinimumWidth(100)

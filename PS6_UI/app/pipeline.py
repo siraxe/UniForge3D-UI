@@ -16,7 +16,7 @@ from paths import (
     ROOT,
     _cellocut_output_path,
     _hi3d_output_path,
-    _lato2_output_path,
+    _lato_output_path,
     _paths_equal,
     _shape512_state_path,
     _shape_state_path,
@@ -376,8 +376,12 @@ class Pipeline(QObject):
                       "stage will upscale exactly this mesh.", "info")
         return target
 
-    def _auto_stage2_rescale(self, info: dict):
-        """Apply the inverse normalization and save the 2nd-stage result."""
+    def _auto_rescale(self, info: dict):
+        """Apply the inverse normalization and save the result in place.
+
+        Used by both the 2nd stage and Hi3D: each worker reports the transform
+        needed to undo the unit normalization applied to its output.
+        """
         loaded = self.viewer.current_path
         target = None
         try:
@@ -556,16 +560,18 @@ class Pipeline(QObject):
                 "LATO.2 needs the LATO.2 source and its checkpoints.\n"
                 "Run get_models.bat (LATO.2) first.\n\nMissing:\n" + shown)
             return
-        output_path = _lato2_output_path(loaded)
+        panel = self.window.right_panel
+        vert_num = int(panel.lato2_verts.value())
+        fill_rings = panel.lato2_fill_rings.isChecked()
+        drop_tiny = panel.lato2_drop_tiny.isChecked()
+        # Name the output after the requested target count so repeated runs
+        # at different settings stay side by side (<model>_lato_2000.glb).
+        output_path = _lato_output_path(loaded, vert_num)
         state_path = _shape512_state_path(output_path)
         if self.jobs.worker.alive:
             self.jobs.worker.stop()
             self.log.emit("UniForge3D worker unloaded to free GPU memory for "
                           "LATO.2.", "info")
-        panel = self.window.right_panel
-        vert_num = int(panel.lato2_verts.value())
-        fill_rings = panel.lato2_fill_rings.isChecked()
-        drop_tiny = panel.lato2_drop_tiny.isChecked()
         self.jobs.begin("lato2")
         self.changed.emit()
         self.jobs.lato2.start(
@@ -774,7 +780,7 @@ class Pipeline(QObject):
             self.log.emit(f"Loaded result into viewer: {out.name}", "ok")
             if (kind == "stage2" and self.jobs.scale_back is not None
                     and _stage2_rescale_enabled()):
-                self._auto_stage2_rescale(self.jobs.scale_back)
+                self._auto_rescale(self.jobs.scale_back)
         else:
             self.log.emit("Could not display result in viewer.", "error")
         self.jobs.convert(out)
@@ -782,13 +788,26 @@ class Pipeline(QObject):
 
     def on_hi3d_done(self, data: dict):
         out = data["output"]
+        scale_back = data.get("scale_back")
+        will_rescale = bool(
+            scale_back and scale_back.get("scaled")
+            and _stage2_rescale_enabled())
         self.log.emit(f"Hi3D finished -> {out}", "ok")
         self.app.set_seed(data["seed"])
-        self.log.emit("Hi3D recenters the result and normalizes it to unit "
-                      "radius; absolute scale is not preserved.", "info")
+        if will_rescale:
+            self.log.emit("Hi3D outputs unit-radius geometry; auto-rescale "
+                          "will restore the source size/location.", "info")
+        else:
+            self.log.emit("Hi3D recenters the result and normalizes it to "
+                          "unit radius; absolute scale is not preserved.",
+                          "info")
         if self.viewer.load(out):
             self.edits.discard("another model was loaded")
             self.log.emit(f"Loaded Hi3D result into viewer: {out.name}", "ok")
+            if will_rescale:
+                info = dict(scale_back)
+                info["output"] = str(out)
+                self._auto_rescale(info)
         else:
             self.log.emit("Could not display the Hi3D result in viewer.",
                           "error")

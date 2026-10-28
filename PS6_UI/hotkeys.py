@@ -24,8 +24,8 @@ class Hotkey:
 HOTKEYS: dict[str, Hotkey] = {
     # File / app (menu bar in main.py)
     "open_folder": Hotkey(
-        "Ctrl+O", "Pick a folder; every *.glb in it appears in the "
-        "Outliner column."),
+        "Ctrl+O", "Pick a folder; every *.glb (and any *.obj without a "
+        "GLB twin) appears in the Outliner column."),
     "settings": Hotkey(
         "Ctrl+,", "Open the Settings dialog."),
     "exit": Hotkey(

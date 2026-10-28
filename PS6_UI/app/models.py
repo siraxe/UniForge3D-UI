@@ -1,4 +1,8 @@
-"""Model-folder contents, loaded-model bookkeeping, and GLB file ops."""
+"""Model-folder contents, loaded-model bookkeeping, and model file ops.
+
+A folder lists its ``*.glb`` files; an ``*.obj`` appears too when it has no
+same-stem GLB beside it (see ``paths._folder_models``).
+"""
 
 from pathlib import Path
 import os
@@ -10,6 +14,7 @@ from PySide6.QtWidgets import QInputDialog, QLineEdit, QMessageBox
 
 from paths import (
     OUTPUT_DIR,
+    _folder_models,
     _model_sidecars,
     _paths_equal,
     _shape512_state_path,
@@ -87,19 +92,22 @@ class ModelLibrary(QObject):
 
     # -- display -------------------------------------------------------------
     def open_folder(self, folder: Path):
-        """List *folder* in the Outliner and load its most useful GLB."""
+        """List *folder* in the Outliner and load its most useful model."""
         folder = Path(folder)
-        glbs = sorted(folder.glob("*.glb"))
+        models = _folder_models(folder)
         self.folder = folder
-        if not glbs:
-            self.log.emit(f"No *.glb files in {folder}.", "warn")
+        if not models:
+            self.log.emit(f"No *.glb files (or unpaired *.obj files) in "
+                          f"{folder}.", "warn")
             self.changed.emit()
             return
-        names = {g.name for g in glbs}
-        first = next((n for n in ("prediction.glb", "prediction_512.glb")
-                      if n in names), glbs[0].name)
+        names = {model.name for model in models}
+        first = next((n for n in (
+            "prediction.glb", "prediction_512.glb",
+            "prediction.obj", "prediction_512.obj") if n in names),
+            models[0].name)
         target = folder / first
-        self.log.emit(f"Opened {folder.name} ({len(glbs)} glb file(s)); "
+        self.log.emit(f"Opened {folder.name} ({len(models)} model file(s)); "
                       f"loading {first} ...", "info")
         if self.viewer.load(target):
             self.adopt(target)
@@ -110,7 +118,7 @@ class ModelLibrary(QObject):
             self.changed.emit()
 
     def show(self, path: Path):
-        """Load one of the folder's GLBs, keeping camera and material."""
+        """Load one of the folder's model files, keeping camera and material."""
         path = Path(path)
         if not path.is_file():
             self.log.emit(f"Model missing: {path}", "warn")
@@ -194,7 +202,7 @@ class ModelLibrary(QObject):
             self.log.emit(f"Could not open Explorer: {ex}", "error")
 
     def duplicate(self, path: Path):
-        """Duplicate one GLB as <stem>_copy.glb (without its sidecars)."""
+        """Duplicate one model file as <stem>_copy (without its sidecars)."""
         path = Path(path)
         if self.jobs.busy:
             QMessageBox.information(
@@ -221,7 +229,7 @@ class ModelLibrary(QObject):
         self.changed.emit()
 
     def rename(self, path: Path):
-        """Rename one GLB and its state sidecars from the Outliner list."""
+        """Rename one model file and its state sidecars from the Outliner."""
         path = Path(path)
         if self.jobs.busy:
             QMessageBox.information(
@@ -239,15 +247,18 @@ class ModelLibrary(QObject):
         if not accepted:
             return
         new_stem = new_stem.strip()
-        if new_stem.lower().endswith(".glb"):
-            new_stem = new_stem[:-4].rstrip()
+        # Keep the entry's own extension: an unpaired OBJ stays an OBJ.
+        for extension in (".glb", ".obj"):
+            if new_stem.lower().endswith(extension):
+                new_stem = new_stem[:-len(extension)].rstrip()
+                break
         if new_stem == path.stem:
             return
         problem = _validate_model_stem(new_stem)
         if problem:
             QMessageBox.warning(parent, "Rename object", problem)
             return
-        new_path = path.with_name(new_stem + ".glb")
+        new_path = path.with_name(new_stem + path.suffix)
         case_only = path.name.lower() == new_path.name.lower()
         if new_path.exists() and not case_only:
             QMessageBox.warning(
@@ -319,7 +330,7 @@ class ModelLibrary(QObject):
                 self.jobs.scale_back["output"] = str(new)
 
     def delete(self, path: Path):
-        """Delete one GLB and its state sidecars from the Outliner list."""
+        """Delete one model file and its state sidecars from the Outliner."""
         path = Path(path)
         if self.jobs.busy:
             QMessageBox.information(

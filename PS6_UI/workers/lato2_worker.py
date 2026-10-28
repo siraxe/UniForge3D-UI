@@ -18,7 +18,7 @@ hi3d_worker.py / cello_worker.py:
            "render_elevation": 30.0}
   stdout: {"type": "ready"}
           {"type": "log", "msg": ..., "level": "info"|"ok"|"warn"|"error"}
-          {"type": "done", "output": "...", "seed": 42,
+          {"type": "done", "output": "...", "obj": "...", "seed": 42,
            "vertex_count": 2000, "face_count": 4000}
           {"type": "error", "msg": "..."}
 
@@ -598,12 +598,42 @@ def _generate(bundle: dict, cmd: dict, device) -> dict:
         emit({"type": "log", "msg": (
             f"Closed small gaps in the decoded topology "
             f"({filled} faces added).")})
+
+    # Undo the dataset's bbox normalization (dataset/voxel_dataset.py maps
+    # the source into [-0.5, 0.5] via center and max extent) so the result
+    # keeps the source mesh's size and position instead of landing centered
+    # in a unit cube.
+    source = trimesh.load(str(mesh_path), process=False, force="mesh")
+    source_v = np.asarray(source.vertices, dtype=np.float64)
+    center = (source_v.min(axis=0) + source_v.max(axis=0)) / 2.0
+    extent = max(
+        float((source_v.max(axis=0) - source_v.min(axis=0)).max()), 1e-7
+    )
+    mesh.vertices = mesh.vertices * extent + center
+    emit({"type": "log", "msg": (
+        "Restored the source mesh's size and position "
+        f"(scale x{extent:.4g}).")})
     vertices = np.asarray(mesh.vertices, dtype=np.float64)
     faces = np.asarray(mesh.faces, dtype=np.int64)
     vertex_count = int(vertices.shape[0])
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     mesh.export(str(output_path))
+
+    # Write a geometry-only OBJ twin next to the GLB for importers that only
+    # read OBJ (the ZBrush plugin). Welding duplicate vertices and dropping
+    # unreferenced ones mirrors the pipeline's OBJ staging and keeps ZBrush's
+    # Import from raising its unused-vertex modal notes.
+    obj_path = output_path.with_suffix(".obj")
+    try:
+        mesh.merge_vertices(merge_norm=True)
+        mesh.remove_unreferenced_vertices()
+        mesh.export(str(obj_path))
+        emit({"type": "log", "msg": f"Saved {obj_path}"})
+    except Exception as ex:  # noqa: BLE001 - the GLB is the primary result
+        emit({"type": "log", "msg": (
+            f"Could not write {obj_path.name}: {ex}"), "level": "warn"})
+        obj_path = None
 
     state_path = (Path(cmd["shape512_state"])
                   if cmd.get("shape512_state") else None)
@@ -623,6 +653,7 @@ def _generate(bundle: dict, cmd: dict, device) -> dict:
     emit({"type": "log", "msg": f"Saved {output_path}", "level": "ok"})
     return {
         "output": str(output_path),
+        "obj": str(obj_path) if obj_path else "",
         "seed": seed,
         "vertex_count": vertex_count,
         "face_count": int(len(faces)),

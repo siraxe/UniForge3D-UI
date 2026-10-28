@@ -18,8 +18,9 @@ Feature parity with the Flet UI:
     on by default) automatically applies the inverse to the 1024 result and
     overwrites the saved stage-2 mesh with it (off leaves the result as-is).
   - Open folder fills the slim Outliner column (attached to the left
-    controls) with one button per *.glb in the folder, so any stage of a
-    result can be viewed (camera and material preserved) and used directly:
+    controls) with one button per *.glb in the folder (plus any *.obj that
+    has no same-stem GLB), so any stage of a result can be viewed (camera
+    and material preserved) and used directly:
     Run CelloCut, Run 2nd stage and Run Hi3D 1536 all operate on the
     displayed model.  Right-clicking an entry offers Rename..., Show obj,
     Duplicate and Delete; Show obj selects the matching .obj sibling in
@@ -36,8 +37,8 @@ Feature parity with the Flet UI:
     the decode phase reports per-stage progress in the log.
   - Run LATO.2 retopologizes the displayed mesh with LATO.2 (V-Flow +
     T-Flow), using a controllable target vertex count. It conditions on a
-    white-model render of the source mesh, saves <model>_lato2.glb plus a
-    <model>_lato2.shape512.pt checkpoint for Run 2nd stage, and runs in
+    white-model render of the source mesh, saves <model>_lato_<verts>.glb
+    plus its .shape512.pt checkpoint for Run 2nd stage, and runs in
     one-shot workers/lato2_worker.py so its ~5 GB of weights unload
     immediately afterwards.
   - Run CelloCut (watertight) repairs the displayed mesh with CelloCut
@@ -261,7 +262,7 @@ class MainWindow(QMainWindow):
         enabled = dialog.stage2_rescale.isChecked()
         _app_settings().setValue("settings/stage2_rescale", enabled)
         self.log(
-            "Settings saved: Uniforge 2nd stage Rescale is "
+            "Settings saved: auto-rescale for 2nd stage and Hi3D is "
             f"{'ON' if enabled else 'OFF'}.", "info")
 
     def _build_viewer(self) -> QWidget:

@@ -1,4 +1,8 @@
-"""Outliner column: one button per GLB, nested by derived names."""
+"""Outliner column: one button per model file, nested by derived names.
+
+Model files are every ``*.glb`` in the folder plus any ``*.obj`` that has no
+same-stem GLB (see ``paths._folder_models``).
+"""
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
@@ -6,7 +10,7 @@ from PySide6.QtWidgets import (
     QToolButton, QVBoxLayout, QWidget,
 )
 
-from paths import _paths_equal
+from paths import _folder_models, _paths_equal
 from utils.layout import underlined_label
 from widgets import _ElidedButton
 
@@ -116,10 +120,12 @@ class OutlinerPanel(QWidget):
 
     def refresh(self):
         folder = self.win.models.folder
-        glbs = sorted(folder.glob("*.glb")) if folder and folder.is_dir() else []
+        # GLBs plus OBJs that have no GLB twin, so import-only assets show up.
         # Natural order: prediction_512 before prediction_1024 before
         # prediction_hi3d_1536 etc. sorted() already does the right thing for
         # our naming scheme.
+        entries = (_folder_models(folder)
+                   if folder and folder.is_dir() else [])
         current = self.win.viewer.current_path
         current_key = current.resolve() if current is not None else None
 
@@ -135,10 +141,11 @@ class OutlinerPanel(QWidget):
                 widget.deleteLater()
         self._show_buttons.clear()
 
-        if not glbs:
+        if not entries:
             hint = QLabel(
-                "Open a folder to list GLB models."
-                if folder is None else "No *.glb files in this folder.")
+                "Open a folder to list models."
+                if folder is None
+                else "No *.glb or *.obj files in this folder.")
             hint.setWordWrap(True)
             hint.setStyleSheet(
                 "color: #888c92; font-size: 10px; padding: 2px;")
@@ -146,40 +153,41 @@ class OutlinerPanel(QWidget):
             self.objects_layout.addStretch(1)
             return
 
-        # Group derived GLBs under their base object.  A GLB whose stem is
-        # "<other stem>_<suffix>" (e.g. obj_512_cellocut) nests under the
-        # GLB named obj_512, but only if obj_512.glb actually exists.
+        # Group derived model files under their base object.  A file whose
+        # stem is "<other stem>_<suffix>" (e.g. obj_512_cellocut) nests under
+        # the file named obj_512, but only if obj_512.glb (or the unpaired
+        # obj_512.obj) actually exists.
         # Nesting follows the names all the way down: obj_512_cellocut_hi
         # nests under obj_512_cellocut as "└─ hi", each level showing only
         # the part of the name that was matched away.
-        stems = {g.stem for g in glbs}
+        stems = {entry.stem for entry in entries}
         lowered = {s: s.lower() for s in stems}
         parent_of = {}
         suffix_of = {}
-        for glb in glbs:
-            s = lowered[glb.stem]
+        for entry in entries:
+            s = lowered[entry.stem]
             best = None
             for other, o in lowered.items():
                 if o != s and s.startswith(o + "_"):
                     if best is None or len(other) > len(best):
                         best = other        # longest matching base wins
-            parent_of[glb.stem] = best
-            suffix_of[glb.stem] = (
-                glb.stem[len(best) + 1:] if best else glb.stem)
+            parent_of[entry.stem] = best
+            suffix_of[entry.stem] = (
+                entry.stem[len(best) + 1:] if best else entry.stem)
 
         roots = []
-        children = {}       # base stem -> [glb, ...] in sorted order
-        for glb in glbs:
-            p = parent_of[glb.stem]
+        children = {}       # base stem -> [entry, ...] in sorted order
+        for entry in entries:
+            p = parent_of[entry.stem]
             if p is None:
-                roots.append(glb)
+                roots.append(entry)
             else:
-                children.setdefault(p, []).append(glb)
+                children.setdefault(p, []).append(entry)
 
-        def _make_btn(glb, level):
-            text = (glb.stem if level == 0
-                    else f"└─ {suffix_of[glb.stem]}")
-            shown = current_key == glb.resolve()
+        def _make_btn(entry, level):
+            text = (entry.stem if level == 0
+                    else f"└─ {suffix_of[entry.stem]}")
+            shown = current_key == entry.resolve()
             btn = _ElidedButton(text)
             btn.setFixedHeight(24)
             btn.setCursor(Qt.PointingHandCursor)
@@ -195,29 +203,30 @@ class OutlinerPanel(QWidget):
                     "QPushButton { text-align: left; padding: 2px 6px;"
                     " font-size: 11px; }"
                     + ("QPushButton { color: #2f9e57; }" if shown else ""))
-            tip = (f"{glb.name}\nCurrently displayed." if shown
-                   else f"Show {glb.name} in the 3D view (camera kept).")
+            tip = (f"{entry.name}\nCurrently displayed." if shown
+                   else f"Show {entry.name} in the 3D view (camera kept).")
             btn.setToolTip(tip + "\nMiddle-click to ghost-compare; "
                            "right-click for more.")
-            btn.clicked.connect(lambda _=False, p=glb: self.win.models.show(p))
+            btn.clicked.connect(
+                lambda _=False, p=entry: self.win.models.show(p))
             btn.middleClicked.connect(
-                lambda p=glb: self.win.models.ghost(p))
+                lambda p=entry: self.win.models.ghost(p))
             ghost = self.win.viewer.ghost_path
-            btn.set_dot(ghost is not None and _paths_equal(ghost, glb))
+            btn.set_dot(ghost is not None and _paths_equal(ghost, entry))
             # Keep the active entry enabled so it still accepts right-clicks;
             # on_show_model treats clicking it as a no-op.
             btn.setContextMenuPolicy(Qt.CustomContextMenu)
             btn.customContextMenuRequested.connect(
-                lambda pos, p=glb, b=btn:
+                lambda pos, p=entry, b=btn:
                     self._show_object_menu(p, b.mapToGlobal(pos)))
             return btn
 
-        def _build_branch(glb, level):
-            """(widget, buttons) for glb followed by everything under it."""
-            btn = _make_btn(glb, level)
+        def _build_branch(entry, level):
+            """(widget, buttons) for entry followed by everything under it."""
+            btn = _make_btn(entry, level)
             btns = [btn]
             child_widgets = []
-            for child in children.get(glb.stem, ()):
+            for child in children.get(entry.stem, ()):
                 cw, cb = _build_branch(child, level + 1)
                 child_widgets.append(cw)
                 btns.extend(cb)

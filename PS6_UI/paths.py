@@ -43,6 +43,23 @@ def _paths_equal(left, right) -> bool:
         return Path(left) == Path(right)
 
 
+def _folder_models(folder: Path) -> list[Path]:
+    """Model files the Outliner lists for *folder*.
+
+    Every ``*.glb`` qualifies.  An ``*.obj`` is listed only when no GLB with
+    the same stem sits beside it: the GLB is then the intended output and the
+    OBJ is its convenience companion (see Show obj), so listing both would
+    duplicate every UniForge result.  OBJ-only assets (imported or exported
+    by other tools) still show up and can be displayed.
+    """
+    folder = Path(folder)
+    glbs = list(folder.glob("*.glb"))
+    glb_stems = {glb.stem.lower() for glb in glbs}
+    objs = [obj for obj in folder.glob("*.obj")
+            if obj.stem.lower() not in glb_stems]
+    return sorted(glbs + objs, key=lambda path: path.name.lower())
+
+
 _INVALID_STEM = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 _RESERVED_STEMS = {
     "CON", "PRN", "AUX", "NUL",
@@ -69,7 +86,9 @@ def _textured_output_path(glb: Path) -> Path:
 
 def _strip_stage_suffixes(stem: str, *, cellocut: bool = True) -> str:
     stem = re.sub(r"_hi3d_\d+$", "", stem)
-    stem = re.sub(r"_lato2$", "", stem)
+    # Current LATO.2 outputs carry their target count (_lato_2000); the
+    # bare _lato2 form is kept so older files still chain correctly.
+    stem = re.sub(r"_lato(?:2|_\d+)$", "", stem)
     if cellocut and stem.endswith("_cellocut"):
         stem = stem[: -len("_cellocut")]
     return stem
@@ -93,9 +112,10 @@ def _hi3d_output_path(glb: Path, resolution: int) -> Path:
     return glb.with_name(f"{stem}_hi3d_{resolution}.glb")
 
 
-def _lato2_output_path(glb: Path) -> Path:
+def _lato_output_path(glb: Path, vert_num: int) -> Path:
+    """Output GLB named after the target vertex count from the panel."""
     stem = _strip_stage_suffixes(glb.stem, cellocut=False)
-    return glb.with_name(f"{stem}_lato2.glb")
+    return glb.with_name(f"{stem}_lato_{int(vert_num)}.glb")
 
 
 def _cellocut_output_path(glb: Path) -> Path:
