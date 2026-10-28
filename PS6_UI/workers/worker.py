@@ -42,7 +42,8 @@ from pathlib import Path
 
 APP_DIR = Path(__file__).resolve().parent.parent    # PS6_UI
 ROOT = APP_DIR.parent                               # repo root
-sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT))                       # tools/
+sys.path.insert(0, str(ROOT / "submodules"))        # uniforge3d source
 sys.path.insert(0, str(APP_DIR))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 

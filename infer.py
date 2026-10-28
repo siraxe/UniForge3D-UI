@@ -1,9 +1,12 @@
 import argparse
 import os
+import sys
 from pathlib import Path
-from uniforge3d import UniForge3DImageTo3DPipeline
 
 ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(ROOT / "submodules"))
+
+from uniforge3d import UniForge3DImageTo3DPipeline
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}
 DEFAULT_MODEL = "xibushu/UniForge3D"
 LOCAL_CONFIG = ROOT / "models" / "xibushu" / "UniForge3D" / "pipeline.json"

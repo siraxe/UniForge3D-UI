@@ -600,7 +600,7 @@ def _config_ref(path: Path, config_dir: Path) -> str:
 
 def build_local_pipeline(dest_root: Path) -> Path:
     """Write a pipeline config whose references are relative to the config."""
-    source = ROOT / "uniforge3d" / "configs" / "pipeline.json"
+    source = ROOT / "submodules" / "uniforge3d" / "configs" / "pipeline.json"
     config = json.loads(source.read_text(encoding="utf-8"))
 
     core_root = dest_root / "xibushu" / "UniForge3D"

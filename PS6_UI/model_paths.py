@@ -14,6 +14,13 @@ LATO.2 stores its checkpoints and DINOv2-L/14-reg encoder under:
 
     models/0x4c48/LATO.2/
     models/0x4c48/LATO.2/dinov2/checkpoints/
+
+Vendored source checkouts live under:
+
+    submodules/uniforge3d/
+    submodules/CelloCut/
+    submodules/Hi3Dv1.0/
+    submodules/LATO.2/
 """
 from __future__ import annotations
 
@@ -21,6 +28,7 @@ import os
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+SUBMODULES_DIR = ROOT / "submodules"
 MODELS_ROOT = ROOT / "models"
 CORE_MODEL_DIR = MODELS_ROOT / "xibushu" / "UniForge3D"
 
@@ -142,11 +150,12 @@ def find_lato2_source() -> Path | None:
     """Locate the LATO.2 *source* checkout.
 
     The PS6 UI runs the source directly because LATO.2 upstream pins older
-    torch/CUDA versions. ``UNIFORGE_LATO2_SOURCE`` can point elsewhere.
+    torch/CUDA versions. Defaults to ``submodules/LATO.2``;
+    ``UNIFORGE_LATO2_SOURCE`` can point elsewhere.
     """
     override = os.environ.get("UNIFORGE_LATO2_SOURCE", "").strip()
     candidates = [Path(override).expanduser()] if override else []
-    candidates.append(ROOT / "LATO.2")
+    candidates.append(SUBMODULES_DIR / "LATO.2")
     for candidate in candidates:
         if (candidate / "scripts" / "e2e_inference.py").is_file():
             return candidate.resolve()
@@ -162,7 +171,7 @@ def missing_lato2_assets(model_dir: Path | None = None) -> list[str]:
     missing: list[str] = []
 
     if find_lato2_source() is None:
-        missing.append(f"LATO.2 source checkout ({ROOT / 'LATO.2'})")
+        missing.append(f"LATO.2 source checkout ({SUBMODULES_DIR / 'LATO.2'})")
 
     lato2_dir = find_lato2_dir(model_dir)
     if lato2_dir is None:
@@ -182,11 +191,12 @@ def find_hi3d_source() -> Path | None:
 
     The PS6 UI runs the source directly instead of pip-installing it because
     Hi3D's package metadata pins Python 3.10 while this app runs on 3.12.
+    Defaults to ``submodules/Hi3Dv1.0``;
     ``UNIFORGE_HI3D_SOURCE`` can point at a checkout outside the project.
     """
     override = os.environ.get("UNIFORGE_HI3D_SOURCE", "").strip()
     candidates = [Path(override).expanduser()] if override else []
-    candidates.append(ROOT / "Hi3Dv1.0")
+    candidates.append(SUBMODULES_DIR / "Hi3Dv1.0")
     for candidate in candidates:
         if (candidate / "sparc3d" / "pipelines" / "sparc3d_pipeline.py").is_file():
             return candidate.resolve()
@@ -203,7 +213,7 @@ def missing_hi3d_assets(model_dir: Path | None = None) -> list[str]:
 
     if find_hi3d_source() is None:
         missing.append(
-            f"Hi3D v1.0 source checkout ({ROOT / 'Hi3Dv1.0'})")
+            f"Hi3D v1.0 source checkout ({SUBMODULES_DIR / 'Hi3Dv1.0'})")
 
     hi3d_dir = find_hi3d_dir(model_dir)
     if hi3d_dir is None:

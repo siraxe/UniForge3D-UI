@@ -25,7 +25,7 @@ from pathlib import Path
 
 APP_DIR = Path(__file__).resolve().parent.parent    # PS6_UI
 ROOT = APP_DIR.parent
-CELLOCUT_DIR = ROOT / "CelloCut"
+CELLOCUT_DIR = ROOT / "submodules" / "CelloCut"
 sys.path.insert(0, str(CELLOCUT_DIR))
 sys.path.insert(0, str(APP_DIR))
 sys.path.insert(0, str(Path(__file__).resolve().parent))

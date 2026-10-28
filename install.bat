@@ -114,7 +114,7 @@ echo [install] Installing flash_attn from Hugging Face ...
 if errorlevel 1 goto :fail
 
 echo [install] Smoke test ...
-"!PY!" -c "import torch, torchvision, flash_attn, cumesh, flex_gemm, o_voxel, nvdiffrast; import cumm, spconv, pyfqmr, torch_scatter; from spconv.pytorch import SparseConv3d; import uniforge3d; import cppmodules, torchcumesh2sdf, maxflow, diso; print('torch', torch.__version__); print('cuda', torch.version.cuda, 'available', torch.cuda.is_available()); print('spconv', spconv.__version__); print('uniforge3d + CelloCut + LATO.2 modules OK')"
+"!PY!" -c "import sys, os; sys.path.insert(0, os.path.join(os.getcwd(), 'submodules')); import torch, torchvision, flash_attn, cumesh, flex_gemm, o_voxel, nvdiffrast; import cumm, spconv, pyfqmr, torch_scatter; from spconv.pytorch import SparseConv3d; import uniforge3d; import cppmodules, torchcumesh2sdf, maxflow, diso; print('torch', torch.__version__); print('cuda', torch.version.cuda, 'available', torch.cuda.is_available()); print('spconv', spconv.__version__); print('uniforge3d + CelloCut + LATO.2 modules OK')"
 if errorlevel 1 goto :fail
 
 echo.

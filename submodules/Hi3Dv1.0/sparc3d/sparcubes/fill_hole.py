@@ -1,4 +1,4 @@
-"""Boundary-loop detection and ear-clipping hole filling for extracted meshes."""
+"""Boundary-loop detection and triangulation of holes in extracted meshes."""
 
 from __future__ import annotations
 
@@ -9,13 +9,19 @@ import torch
 
 from sparc3d.structures.point import Mesh
 
+try:
+    import mapbox_earcut
+except ImportError:  # the numpy ear-clipping fallback still works
+    mapbox_earcut = None
+
 
 def fill_mesh_holes(mesh: Mesh, length_thresh: int = 10000) -> Mesh:
-    """Close every boundary loop of a triangle mesh by ear clipping.
+    """Close every boundary loop of a triangle mesh.
 
     Boundary half-edges are found on the GPU, then each loop is triangulated on the
-    CPU with numpy. Loops longer than ``length_thresh`` are left open, since ear
-    clipping is quadratic in the loop length.
+    CPU. ``mapbox_earcut`` triangulates the loop in its best-fit plane, with the
+    quadratic numpy ear-clipper kept as a fallback. Loops longer than
+    ``length_thresh`` are left open.
 
     Args:
         mesh: Mesh to repair. Vertices are reused unchanged; only faces are added.
@@ -52,14 +58,90 @@ def fill_mesh_holes(mesh: Mesh, length_thresh: int = 10000) -> Mesh:
 
     loops = _boundary_loops(boundary_directed.cpu().numpy().astype(int))
 
-    new_faces = [
-        _ear_clip(vertices, loop) for loop in loops if 3 <= len(loop) <= length_thresh
-    ]
+    if loops:
+        # One host copy for all loops. Gathering each loop's vertices from the
+        # CUDA tensor (and syncing) separately dominated extraction at 1536,
+        # where the isosurface can leave hundreds of thousands of tiny loops.
+        source = vertices.detach().cpu().numpy()
+        new_faces = [
+            _triangulate_loop(source, loop)
+            for loop in loops
+            if 3 <= len(loop) <= length_thresh
+        ]
+    else:
+        new_faces = []
     if new_faces:
         appended = torch.from_numpy(np.vstack(new_faces)).long().to(device)
         faces = torch.cat([faces, appended], dim=0)
 
     return Mesh(vertices=vertices, faces=faces)
+
+
+def _triangulate_loop(vertices: np.ndarray, boundary: List[int]) -> np.ndarray:
+    """Triangulate one boundary loop, wound opposite to its boundary edges.
+
+    The fill follows the same orientation as the old ear-clipper so the added
+    triangles agree with the surrounding surface.
+    """
+    indices = np.asarray(boundary, dtype=np.int64)
+    if len(indices) == 3:
+        return indices[[2, 1, 0]]
+    points = vertices[indices]
+    triangles = _earcut(points)
+    if triangles is None:
+        return _ear_clip(points, indices)
+    return indices[triangles]
+
+
+def _earcut(points: np.ndarray) -> np.ndarray | None:
+    """Triangulate a 3D loop in its best-fit plane with mapbox_earcut.
+
+    Returns local triangle indices, or ``None`` when the loop is degenerate and
+    the caller should fall back to ear clipping.
+    """
+    if mapbox_earcut is None or len(points) < 4:
+        return None
+    centered = points.astype(np.float64, copy=False)
+    centered = centered - centered.mean(axis=0, keepdims=True)
+    radius = float(np.max(np.linalg.norm(centered, axis=1)))
+    if not np.isfinite(radius) or radius <= 0.0:
+        return None
+
+    # Newell normal: robust for non-planar loops and cheap for long ones.
+    normal = np.cross(centered, np.roll(centered, -1, axis=0)).sum(axis=0)
+    norm = float(np.linalg.norm(normal))
+    if not np.isfinite(norm) or norm <= radius * radius * 1e-12:
+        return None
+    normal = normal / norm
+
+    helper = np.array([1.0, 0.0, 0.0])
+    if abs(float(normal @ helper)) > 0.9:
+        helper = np.array([0.0, 1.0, 0.0])
+    u = np.cross(helper, normal)
+    u /= np.linalg.norm(u)
+    v = np.cross(normal, u)
+    coords = np.stack([centered @ u, centered @ v], axis=1)
+
+    x, y = coords[:, 0], coords[:, 1]
+    area2 = float(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1)))
+    if not np.isfinite(area2) or abs(area2) <= radius * radius * 1e-12:
+        return None
+
+    try:
+        triangles = mapbox_earcut.triangulate_float64(
+            np.ascontiguousarray(coords),
+            np.array([len(coords)], dtype=np.uint32),
+        ).reshape(-1, 3)
+    except Exception:  # noqa: BLE001 - fall back to the numpy path
+        return None
+    if triangles.size == 0:
+        return None
+    # mapbox_earcut emits counter-clockwise triangles in the projected frame.
+    # The fill convention is opposite to the boundary loop order, so flip when
+    # the loop itself runs counter-clockwise.
+    if area2 > 0.0:
+        triangles = triangles[:, [0, 2, 1]]
+    return triangles
 
 
 def _boundary_loops(boundary: np.ndarray) -> List[List[int]]:
@@ -96,10 +178,10 @@ def _boundary_loops(boundary: np.ndarray) -> List[List[int]]:
     return loops
 
 
-def _ear_clip(vertices: torch.Tensor, boundary: List[int]) -> np.ndarray:
+def _ear_clip(points: np.ndarray, boundary: np.ndarray) -> np.ndarray:
     """Triangulate one boundary loop, repeatedly clipping its sharpest corner."""
-    boundline = vertices[torch.tensor(boundary, device=vertices.device)].cpu().numpy()
-    boundline_idx = np.array(boundary, dtype=int)
+    boundline = np.asarray(points, dtype=np.float64)
+    boundline_idx = np.asarray(boundary, dtype=np.int64)
 
     faces_hole = []
     while True:

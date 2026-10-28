@@ -34,11 +34,11 @@ import sys
 from pathlib import Path
 
 APP_DIR = Path(__file__).resolve().parent.parent    # PS6_UI
-ROOT = APP_DIR.parent
 sys.path.insert(0, str(APP_DIR))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from model_paths import (
+    SUBMODULES_DIR,
     find_clip_dir,
     find_dinov2_dir,
     find_hi3d_dir,
@@ -226,7 +226,7 @@ def main() -> int:
     if source is None:
         emit({"type": "error", "msg": (
             "Hi3D v1.0 source checkout was not found. Expected "
-            f"{ROOT / 'Hi3Dv1.0'} (or set UNIFORGE_HI3D_SOURCE).")})
+            f"{SUBMODULES_DIR / 'Hi3Dv1.0'} (or set UNIFORGE_HI3D_SOURCE).")})
         return 1
     sys.path.insert(0, str(source))
 

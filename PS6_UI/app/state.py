@@ -95,7 +95,11 @@ class AppState(QObject):
         self.ref_reference = None
         restored = 0
         for src in files:
-            cutout = src.with_name(src.stem + "_cutout.png")
+            # _copy_input_images stores sources as <stem>_src.png next to
+            # <stem>_cutout.png, so strip the _src suffix before probing for
+            # the cutout (a drag-dropped <stem>.png maps to <stem>_cutout.png).
+            stem = src.stem[:-4] if src.stem.endswith("_src") else src.stem
+            cutout = src.with_name(stem + "_cutout.png")
             if cutout.is_file():
                 self.cutout_map[src] = cutout
                 restored += 1

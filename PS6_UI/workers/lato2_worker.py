@@ -39,11 +39,11 @@ import tempfile
 from pathlib import Path
 
 APP_DIR = Path(__file__).resolve().parent.parent    # PS6_UI
-ROOT = APP_DIR.parent
 sys.path.insert(0, str(APP_DIR))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from model_paths import (
+    SUBMODULES_DIR,
     find_lato2_dir,
     find_lato2_source,
     find_model_dir,
@@ -644,7 +644,7 @@ def main() -> int:
     if source is None:
         emit({"type": "error", "msg": (
             "LATO.2 source checkout was not found. Expected "
-            f"{ROOT / 'LATO.2'} (or set UNIFORGE_LATO2_SOURCE).")})
+            f"{SUBMODULES_DIR / 'LATO.2'} (or set UNIFORGE_LATO2_SOURCE).")})
         return 1
     sys.path.insert(0, str(source))
     # PS6_UI has its own regular ``utils`` package; it would shadow LATO.2's

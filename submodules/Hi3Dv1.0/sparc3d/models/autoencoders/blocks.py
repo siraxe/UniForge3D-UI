@@ -592,8 +592,13 @@ class SerializedUnpooling(PointModule):
             requires_grad=False,
         )
 
+    @force_fp32(mode="convert_back")
     def forward(self, point: Point) -> Point:
         """Split each voxel into eight children and keep the ones predicted occupied."""
+        # The 8x projection below overflows fp16 autocast at the coarse-to-fine
+        # doublings: features hit +-65504, the occupancy logits turn to NaN, and
+        # ``kept`` collapses to 0, which later trips ``grid.min()`` on an empty
+        # coord tensor. fp32 here is exact and the retained rows are unchanged.
         pred_octree = self.cls_head(point).feat
         n = point.feat.shape[0]
         c = self.proj.out_features // 8

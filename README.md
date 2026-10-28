@@ -25,7 +25,8 @@ multi-view images. Apache-2.0, same as upstream.
 
 Run in that order. `get_models.bat` fetches from public Hugging Face and ModelScope
 mirrors and is resumable — re-run it if a download is interrupted. `start_UI.bat`
-auto-detects the model tree and applies VRAM safeguards.
+auto-detects the model tree and applies VRAM safeguards. Vendored source checkouts
+(`uniforge3d`, `CelloCut`, `Hi3Dv1.0`, `LATO.2`) live under `submodules/`.
 
 ## Tools & viewer
 
@@ -58,7 +59,7 @@ and save their results next to it.
         <strong>Voxel budget</strong> (100% = 80k/90k/110k) and
         <strong>Full GPU</strong> (faster, much higher VRAM; otherwise
         follows Low VRAM).</li>
-        <li>Uses <code>Hi3Dv1.0/</code> or
+        <li>Uses <code>submodules/Hi3Dv1.0/</code> or
         <code>UNIFORGE_HI3D_SOURCE</code>; <code>get_models.bat</code>
         downloads ~10.7 GB (Hi3D + DINOv2 + CLIP). Output is unit-normalized,
         and 1536 remains VRAM-heavy.</li>
@@ -90,7 +91,8 @@ and save their results next to it.
         T-Flow) at a target vertex count.</li>
         <li>Saves <code>&lt;model&gt;_lato2.glb</code> plus
         <code>&lt;model&gt;_lato2.shape512.pt</code>; geometry only.
-        <code>get_models.bat</code> fetches the source and checkpoints.</li>
+        The source lives in <code>submodules/LATO.2</code>;
+        <code>get_models.bat</code> fetches its checkpoints.</li>
         <li>The <code>Remesh_LATO2:</code> panel has
         <strong>fill quad rings</strong> and <strong>drop small patches</strong>
         toggles; clean leftover holes with <strong>Close Holes</strong>.</li>
@@ -130,14 +132,14 @@ original **[UniForge3D](https://github.com/xibushu/UniForge3D)** repo, which bui
 
 - **Everything else** (this UI, the packaging, and upstream UniForge3D):
   [Apache License 2.0](LICENSE), matching the upstream project.
-- **Vendored VGGT code** (`uniforge3d/models/vggt/`): VGGT's
+- **Vendored VGGT code** (`submodules/uniforge3d/models/vggt/`): VGGT's
   [CC BY-NC 4.0](https://github.com/facebookresearch/vggt/blob/main/LICENSE.txt) —
   non-commercial use only.
 - **BRIA RMBG-2.0** (background removal weights fetched by `get_models.bat`):
   BRIA's [custom license](https://huggingface.co/briaai/RMBG-2.0) — free for
   non-commercial use; commercial use requires a license from BRIA AI.
-- **Hi3D v1.0** (`Hi3Dv1.0/` source and the `hi3d-official/Hi3Dv1.0` weights):
-  the [Hi3D Open License Agreement Version 1.0](Hi3Dv1.0/LICENSE). Commercial
+- **Hi3D v1.0** (`submodules/Hi3Dv1.0/` source and the `hi3d-official/Hi3Dv1.0` weights):
+  the [Hi3D Open License Agreement Version 1.0](submodules/Hi3Dv1.0/LICENSE). Commercial
   use is permitted below its scale threshold (200,000 MAU / USD 1M monthly
   revenue); commercial integrations must display **Powered by Hi3D 1.0**
   linking to [hi3d.ai](http://hi3d.ai/).

@@ -131,6 +131,10 @@ class Pipeline(QObject):
         """Load a project folder's images, then its models."""
         folder = Path(folder)
         self.jobs.clear_pending()
+        # The Early-stop run bookkeeping belongs to the previously opened
+        # project; keeping it would make Hi3D / 2nd stage prefer that run's
+        # images over this folder's REF selection.
+        self.models.clear_stage1()
         loaded = self.app.load_folder(folder)
         if loaded is not None:
             count, restored, inputs = loaded
@@ -420,20 +424,33 @@ class Pipeline(QObject):
 
     # -- Hi3D / CelloCut -----------------------------------------------------
     def _hi3d_condition_image(self) -> Path | None:
-        stage1_images = self.models.stage1_images
-        if not stage1_images:
-            return None
+        stage1_images = self.models.stage1_images or []
         run_images = {p.resolve() for p in stage1_images}
         if self.app.ref_reference is not None:
             source = self.app.ref_reference
             candidate = self.app.cutout_map.get(source, source)
-            for path in (candidate, source):
-                if path.resolve() in run_images:
-                    return path
-            self.log.emit("The selected REF image was not part of the Early "
-                          "stop run; using that run's first image for Hi3D.",
-                          "warn")
-        return stage1_images[0]
+            if not run_images:
+                # Opened from a project folder: there is no tracked Early stop
+                # run, but the REF panel already holds this project's images.
+                if candidate.is_file():
+                    return candidate
+                if source.is_file():
+                    return source
+            else:
+                for path in (candidate, source):
+                    if path.resolve() in run_images:
+                        return path
+                self.log.emit("The selected REF image was not part of the "
+                              "Early stop run; using that run's first image "
+                              "for Hi3D.", "warn")
+        if stage1_images:
+            return stage1_images[0]
+        # No run bookkeeping at all: fall back to the imported project images
+        # so a REF selection made in the panel is honoured after Open folder.
+        for source in self.app.image_paths:
+            if source.is_file():
+                return self.app.cutout_map.get(source, source)
+        return None
 
     def run_hi3d(self):
         """Run Hi3D v1.0 with the passes chosen in the dropdown."""
