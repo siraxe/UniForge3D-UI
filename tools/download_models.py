@@ -70,6 +70,14 @@ LATO2_BASE = (
     "https://huggingface.co/0x4c48/LATO.2/resolve/"
     "a91090e8077b9318ab87ac08fd9eb905903d4515/"
 )
+ULTRATEX_BASE = (
+    "https://huggingface.co/Comfy-Org/UltraTex/resolve/"
+    "8020f2c3a384ba5429aa707442fa6728597c7bcb/"
+)
+KLEIN9B_BASE = (
+    "https://huggingface.co/Comfy-Org/Flux-2-Klein-9B/resolve/"
+    "1138ce884c8e977cdacacbe779784fec4426bb3f/"
+)
 DINOV2_REG4_URL = (
     "https://dl.fbaipublicfiles.com/dinov2/dinov2_vitl14/"
     "dinov2_vitl14_reg4_pretrain.pth"
@@ -390,6 +398,63 @@ LATO2_GROUPS: tuple[ModelGroup, ...] = (
 )
 
 
+# UltraTex texture generation is an optional group (Run UltraTex): the
+# FLUX.2 Klein 9B diffusion model (int8-convrot build; the 18.2 GB bf16
+# checkpoint is intentionally NOT downloaded), both VAEs (the fine-tuned
+# UltraTex decoder for the main pass, the stock Klein VAE for the refine
+# pass), the UltraTex albedo and metallic-roughness LoRAs, and the
+# precomputed empty-prompt embedding (UltraTex is trained with an empty
+# prompt, so no text encoder is needed).
+ULTRATEX_GROUPS: tuple[ModelGroup, ...] = (
+    ModelGroup(
+        "Comfy-Org/UltraTex",
+        "Hugging Face, open (UltraTex rev 8020f2c3 + Klein-9B rev 1138ce88)",
+        (
+            DownloadFile(
+                "diffusion_models/flux-2-klein-base-9b_int8_convrot.safetensors",
+                ULTRATEX_BASE
+                + "diffusion_models/flux-2-klein-base-9b_int8_convrot.safetensors",
+                9_439_884_541,
+                "6cb081e6ad1bc876f5edaf757ce36ec1419969e8b97e6dc0771cd3ff7d864771",
+            ),
+            DownloadFile(
+                "vae/ultratex_flux2_vae_fp32.safetensors",
+                ULTRATEX_BASE + "vae/ultratex_flux2_vae_fp32.safetensors",
+                336_211_292,
+                "48d3b69e2c4667ea8d26972d67b28cdf4e0d63fa25b39dd2bb2849041ddc5a1f",
+            ),
+            DownloadFile(
+                "vae/flux2-vae.safetensors",
+                KLEIN9B_BASE + "split_files/vae/flux2-vae.safetensors",
+                336_211_292,
+                "868fe7b343cc8f3a19dbcfcafbc3d5f888802be3f89bd81b65b3621a066ce8f3",
+            ),
+            DownloadFile(
+                "loras/ultratex_flux2_klein_9b_albedo_lora_bf16.safetensors",
+                ULTRATEX_BASE
+                + "loras/ultratex_flux2_klein_9b_albedo_lora_bf16.safetensors",
+                478_172_752,
+                "3b1915177a81bc2ab43f501355bf39113df0128e6cbc6fedf8b8621d5e06a01c",
+            ),
+            DownloadFile(
+                "loras/ultratex_flux2_klein_9b_metallic_roughness_lora_bf16.safetensors",
+                ULTRATEX_BASE
+                + "loras/ultratex_flux2_klein_9b_metallic_roughness_lora_bf16.safetensors",
+                478_172_752,
+                "13e94f5a30a789b1e3e76d8c96cbba5f52fb2f68411e56377f382e145da23fc1",
+            ),
+            DownloadFile(
+                "embeddings/flux-2-klein-9b_empty_prompt.safetensors",
+                ULTRATEX_BASE
+                + "embeddings/flux-2-klein-9b_empty_prompt.safetensors",
+                25_170_136,
+                "e669c60cb10b22a71b4fd5b7150595cc95090bd7958abe4a8e6917a482957de7",
+            ),
+        ),
+    ),
+)
+
+
 def fmt_bytes(value: float) -> str:
     if value >= 1_000_000_000:
         return f"{value / 1_000_000_000:.2f} GB"
@@ -701,8 +766,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--groups", default="all",
         help="comma-separated model sets: 'main' (UniForge3D + TRELLIS + "
              "preprocessors), 'hi3d' (Hi3Dv1.0 snapshot + encoders), 'lato2' "
-             "(LATO.2 checkpoints + DINOv2-L/14-reg), or 'all' (default). "
-             "Combine with commas, e.g. main,lato2.",
+             "(LATO.2 checkpoints + DINOv2-L/14-reg), 'ultratex' (FLUX.2 "
+             "Klein 9B int8 + UltraTex LoRAs/VAE/embedding), or 'all' "
+             "(default). Combine with commas, e.g. main,lato2.",
     )
     return parser.parse_args(argv)
 
@@ -711,21 +777,23 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     dest = args.dest.expanduser().resolve()
     requested = [g.strip().lower() for g in args.groups.split(",") if g.strip()]
-    valid_groups = {"main", "hi3d", "lato2", "all"}
+    valid_groups = {"main", "hi3d", "lato2", "ultratex", "all"}
     unknown = [g for g in requested if g not in valid_groups]
     if unknown or not requested:
         print(f"[get_models] ERROR: unknown --groups value(s): {', '.join(unknown) or '(empty)'}")
-        print("[get_models] Valid values: all, main, hi3d, lato2 (comma-separated).")
+        print("[get_models] Valid values: all, main, hi3d, lato2, ultratex (comma-separated).")
         return 2
     if "all" in requested:
-        include_main = include_hi3d = include_lato2 = True
+        include_main = include_hi3d = include_lato2 = include_ultratex = True
     else:
         include_main = "main" in requested
         include_hi3d = "hi3d" in requested
         include_lato2 = "lato2" in requested
+        include_ultratex = "ultratex" in requested
     groups: tuple[ModelGroup, ...] = (
         (GROUPS if include_main else ())
         + (LATO2_GROUPS if include_lato2 else ())
+        + (ULTRATEX_GROUPS if include_ultratex else ())
     )
     repo_groups: tuple[RepoGroup, ...] = REPO_GROUPS if include_hi3d else ()
     all_files = [(group, spec) for group in groups for spec in group.files]
@@ -737,10 +805,11 @@ def main(argv: list[str] | None = None) -> int:
         for relative in group.required_files
     ]
 
-    print("[get_models] UniForge3D + Hi3D + LATO.2 model downloader")
+    print("[get_models] UniForge3D + Hi3D + LATO.2 + UltraTex model downloader")
     print(f"[get_models] Destination: {dest}")
     print("[get_models] Layout: <owner>/<repo>/... (model files stored directly)")
-    if not include_main and not include_hi3d and not include_lato2:
+    if not include_main and not include_hi3d and not include_lato2 \
+            and not include_ultratex:
         print("[get_models] No model set selected; nothing to do.")
         return 0
     print(
@@ -750,6 +819,7 @@ def main(argv: list[str] | None = None) -> int:
                 ("Main models", include_main),
                 ("Hi3Dv1.0", include_hi3d),
                 ("LATO.2", include_lato2),
+                ("UltraTex", include_ultratex),
             ) if on
         )
     )

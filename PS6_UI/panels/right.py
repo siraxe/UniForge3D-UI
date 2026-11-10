@@ -361,6 +361,183 @@ class RightPanel(QWidget):
         self.btn_lato2.clicked.connect(lambda: self.win.pipeline.run_lato2())
         layout.addWidget(self.btn_lato2)
 
+        # -- UV (unwrap) ------------------------------------------------------
+        layout = accordion_section(root, "UV")
+
+        self.ut_uv_res = QComboBox()
+        for res in (1024, 2048, 4096):
+            self.ut_uv_res.addItem(f"{res}", res)
+        self.ut_uv_res.setCurrentIndex(1)          # 2048
+        self.ut_uv_res.setMinimumWidth(100)
+        self.ut_uv_res.setToolTip(
+            "UV atlas resolution: the chart packer targets this atlas size "
+            "and the later UltraTex texture pass bakes into it")
+
+        self.ut_uv_padding = QSpinBox()
+        self.ut_uv_padding.setRange(0, 16)
+        self.ut_uv_padding.setValue(4)
+        self.ut_uv_padding.setSuffix(" px")
+        self.ut_uv_padding.setMinimumWidth(100)
+        self.ut_uv_padding.setToolTip(
+            "Gutter between UV charts, in texels (bleeds colour across "
+            "seams so mipmaps don't pull in black)")
+
+        uv_form = QFormLayout()
+        uv_form.setContentsMargins(0, 0, 0, 0)
+        uv_form.setHorizontalSpacing(8)
+        uv_form.setVerticalSpacing(3)
+        uv_form.addRow("atlas", self.ut_uv_res)
+        uv_form.addRow("padding", self.ut_uv_padding)
+        layout.addLayout(uv_form)
+
+        self.ut_hint = QLabel(
+            "xatlas unwrap: cuts UV seams and packs the charts into one "
+            "atlas. Seams duplicate vertices, so run it as the last "
+            "geometry step - later topology edits drop the UVs. The UVs "
+            "are written as TEXCOORD_0 on Save/Bake.")
+        self.ut_hint.setWordWrap(True)
+        self.ut_hint.setStyleSheet("color: #9a9ea6; font-size: 10px;")
+        layout.addWidget(self.ut_hint)
+
+        self.btn_uv_unwrap = QPushButton("Unwrap UVs")
+        self.btn_uv_unwrap.setFixedHeight(28)
+        self.btn_uv_unwrap.setToolTip(
+            "Unwrap the displayed mesh into a UV atlas (xatlas)")
+        self.btn_uv_unwrap.clicked.connect(self._run_uv_unwrap)
+        layout.addWidget(self.btn_uv_unwrap)
+
+        self.ut_status = QLabel("")
+        self.ut_status.setWordWrap(True)
+        self.ut_status.setStyleSheet("color: #9a9ea6; font-size: 10px;")
+        self.ut_status.setToolTip("UV unwrap status")
+        layout.addWidget(self.ut_status)
+
+        # -- UltraTex (texture generation) -----------------------------------
+        layout = accordion_section(root, "UltraTex")
+
+        self.utex_output = QComboBox()
+        for label, mode in (
+            ("Albedo", "albedo"),
+            ("Albedo + PBR (metallic/roughness)", "albedo_pbr"),
+        ):
+            self.utex_output.addItem(label, mode)
+        self.utex_output.setCurrentIndex(0)
+        self.utex_output.setMinimumWidth(160)
+        self.utex_output.setToolTip(
+            "Generated texture set: albedo always; PBR adds the "
+            "metallic/roughness LoRA pass")
+
+        self.utex_render = QComboBox()
+        for res in (512, 1024, 1536, 2048):
+            self.utex_render.addItem(f"{res}", res)
+        self.utex_render.setCurrentIndex(1)        # 1024
+        self.utex_render.setMinimumWidth(100)
+        self.utex_render.setToolTip(
+            "Per-view render resolution (world-normal + texture views)")
+
+        self.utex_bake = QComboBox()
+        for res in (2048, 4096, 8192):
+            self.utex_bake.addItem(f"{res}", res)
+        self.utex_bake.setCurrentIndex(1)          # 4096
+        self.utex_bake.setMinimumWidth(100)
+        self.utex_bake.setToolTip(
+            "Baked atlas resolution (Bake Texture From Views)")
+
+        self.utex_steps = QSpinBox()
+        self.utex_steps.setRange(1, 50)
+        self.utex_steps.setValue(8)
+        self.utex_steps.setMinimumWidth(100)
+        self.utex_steps.setToolTip(
+            "Sampler steps per pass (the albedo pass uses half when the "
+            "distill LoRA is on; CFG is fixed at 1 - UltraTex trains with "
+            "an empty prompt)")
+
+        self.utex_seed = QSpinBox()
+        self.utex_seed.setRange(0, 2**31 - 1)
+        self.utex_seed.setValue(1)
+        self.utex_seed.setMinimumWidth(100)
+        self.utex_seed.setToolTip("Sampler seed")
+
+        self.utex_seed_random = QCheckBox("random")
+        self.utex_seed_random.setChecked(False)
+        self.utex_seed_random.setToolTip(
+            "Pick a new random seed for every run (unchecked = use the "
+            "seed above, same-seed re-runs)")
+
+        utex_form = QFormLayout()
+        utex_form.setContentsMargins(0, 0, 0, 0)
+        utex_form.setHorizontalSpacing(8)
+        utex_form.setVerticalSpacing(3)
+        utex_form.addRow("output", self.utex_output)
+        utex_form.addRow("render", self.utex_render)
+        utex_form.addRow("bake", self.utex_bake)
+        utex_form.addRow("steps", self.utex_steps)
+        seed_row = QHBoxLayout()
+        seed_row.setContentsMargins(0, 0, 0, 0)
+        seed_row.setSpacing(6)
+        seed_row.addWidget(self.utex_seed, 1)
+        seed_row.addWidget(self.utex_seed_random)
+        utex_form.addRow("seed", seed_row)
+        layout.addLayout(utex_form)
+
+        self.utex_refine = QCheckBox("refine passes")
+        self.utex_refine.setChecked(True)
+        self.utex_refine.setToolTip(
+            "After each bake: re-render the textured mesh, re-encode and "
+            "sample a few low-denoise steps to clean up bake artifacts "
+            "(2 steps, denoise 0.1/0.2)")
+
+        self.utex_second_rig = QCheckBox("second rig")
+        self.utex_second_rig.setChecked(True)
+        self.utex_second_rig.setToolTip(
+            "Second camera rig (azimuth 45 + top/bottom pair) re-samples "
+            "texels the first rig saw poorly, masked by the confidence "
+            "bake (Differential Diffusion)")
+
+        self.utex_hint = QLabel(
+            "FLUX.2 Klein 9B int8 + UltraTex LoRAs, run in-app (needs the "
+            "UltraTex model group from get_models.bat). Unwrap UVs first; "
+            "the bake reuses the UV atlas at the chosen resolution.")
+        self.utex_hint.setWordWrap(True)
+        self.utex_hint.setStyleSheet("color: #9a9ea6; font-size: 10px;")
+        layout.addWidget(self.utex_hint)
+
+        self.btn_bake_ws = QPushButton("Bake WS Normal")
+        self.btn_bake_ws.setFixedHeight(28)
+        self.btn_bake_ws.setToolTip(
+            "World-space normal atlas: the displayed mesh is the low-poly "
+            "target (its smoothed normals steer the projection, Maya-style); "
+            "the middle-click marked mesh is the high-poly source. Saves "
+            "<mesh>_wsnormal.png next to the displayed mesh. Requires UVs "
+            "on the displayed mesh.")
+        self.btn_bake_ws.clicked.connect(self._bake_ws_normal)
+        layout.addWidget(self.btn_bake_ws)
+
+        self.btn_ultratex = QPushButton("Run UltraTex")
+        self.btn_ultratex.setFixedHeight(28)
+        self.btn_ultratex.setToolTip(
+            "Generate textures for the displayed mesh (needs UVs)")
+        self.btn_ultratex.clicked.connect(self._run_ultratex)
+        layout.addWidget(self.btn_ultratex)
+
+        # Swap-in Stop button while the UltraTex worker subprocess runs.
+        self.btn_utex_stop = QPushButton("Stop UltraTex")
+        self.btn_utex_stop.setFixedHeight(28)
+        self.btn_utex_stop.setStyleSheet(
+            "QPushButton { background-color: #a04040; color: white; "
+            "font-weight: 600; }")
+        self.btn_utex_stop.setToolTip(
+            "Kill the UltraTex worker subprocess (nothing is written)")
+        self.btn_utex_stop.clicked.connect(lambda: self.win.pipeline.stop())
+        self.btn_utex_stop.setVisible(False)
+        layout.addWidget(self.btn_utex_stop)
+
+        self.utex_status = QLabel("")
+        self.utex_status.setWordWrap(True)
+        self.utex_status.setStyleSheet("color: #9a9ea6; font-size: 10px;")
+        self.utex_status.setToolTip("UltraTex texture generation status")
+        layout.addWidget(self.utex_status)
+
         root.addStretch(1)
         scroll.setWidget(content)
         outer.addWidget(scroll, 1)
@@ -456,6 +633,22 @@ class RightPanel(QWidget):
         self.lato2_fill_rings.setEnabled(file_op_on)
         self.lato2_drop_tiny.setEnabled(file_op_on)
         self.btn_lato2.setEnabled(file_op_on)
+        self.ut_uv_res.setEnabled(file_op_on)
+        self.ut_uv_padding.setEnabled(file_op_on)
+        self.btn_uv_unwrap.setEnabled(file_op_on)
+        self.utex_output.setEnabled(file_op_on)
+        self.utex_render.setEnabled(file_op_on)
+        self.utex_bake.setEnabled(file_op_on)
+        self.utex_steps.setEnabled(file_op_on)
+        self.utex_seed.setEnabled(file_op_on)
+        self.utex_seed_random.setEnabled(file_op_on)
+        self.utex_refine.setEnabled(file_op_on)
+        self.utex_second_rig.setEnabled(file_op_on)
+        self.btn_bake_ws.setEnabled(file_op_on and state.donor_ok)
+        self.btn_ultratex.setEnabled(file_op_on)
+        # Run UltraTex swaps to Stop while the worker subprocess runs.
+        self.btn_ultratex.setVisible(not state.utex)
+        self.btn_utex_stop.setVisible(state.utex)
         self.btn_save.setEnabled(state.idle and state.pending_edit)
         self.btn_save_replace.setEnabled(state.idle and state.pending_edit)
         self.btn_split.setEnabled(state.idle and state.has_model
@@ -526,6 +719,26 @@ class RightPanel(QWidget):
         self.win.edits.run_decimate(
             target_tris=self.decimate_tris.value() * 1000)
 
+    def _run_uv_unwrap(self):
+        self.win.edits.run_uv_unwrap(
+            resolution=self.ut_uv_res.currentData(),
+            padding=self.ut_uv_padding.value())
+
+    def _bake_ws_normal(self):
+        self.win.pipeline.run_bake_ws_normal(
+            resolution=self.utex_bake.currentData())
+
+    def _run_ultratex(self):
+        self.win.pipeline.run_ultratex(
+            output_mode=self.utex_output.currentData(),
+            render_size=self.utex_render.currentData(),
+            bake_size=self.utex_bake.currentData(),
+            steps=self.utex_steps.value(),
+            seed=None if self.utex_seed_random.isChecked()
+            else self.utex_seed.value(),
+            refine=self.utex_refine.isChecked(),
+            second_rig=self.utex_second_rig.isChecked())
+
     def _run_subdivide(self):
         self.win.edits.run_subdivide()
 
@@ -573,6 +786,13 @@ class RightPanel(QWidget):
         mode = self.reproject_mode.currentData()
         self.reproject_hint.setText(hints.get(mode, ""))
 
+    def on_ultratex_status(self, msg: str, level: str = "info"):
+        """Live status line while the UltraTex worker runs."""
+        color = {"ok": "#8fd18f", "warn": "#f0c674",
+                 "error": "#e06c75"}.get(level, "#f0c674")
+        self.utex_status.setText(f"UltraTex: {msg}")
+        self.utex_status.setStyleSheet(f"color: {color}; font-size: 10px;")
+
     def on_remesh_progress(self, percent: int, stage: str):
         """Live progress line while the remesher pipeline runs."""
         self.remesh_status.setText(
@@ -610,8 +830,3 @@ class RightPanel(QWidget):
             # no "Ready" line by default; the label only appears when the
             # remesher runs (progress) or is unavailable (error)
             self.remesh_status.setText("")
-        else:
-            self.remesh_status.setText(
-                f"Remesh unavailable: {state.get('error', 'unknown')}")
-            self.remesh_status.setStyleSheet(
-                "color: #e06c75; font-size: 10px;")

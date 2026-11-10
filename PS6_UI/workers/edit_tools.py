@@ -208,6 +208,74 @@ class DecimateController(QObject):
             self.state_changed.emit(False)
 
 
+class UVUnwrapController(QObject):
+    """xatlas UV unwrap of the displayed mesh (seams duplicate vertices)."""
+
+    log_line = Signal(str, str)
+    state_changed = Signal(bool)
+    uv_unwrap_done = Signal(object)
+    uv_unwrap_failed = Signal(str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._running = False
+        self._cancel = threading.Event()
+
+    @property
+    def running(self) -> bool:
+        return self._running
+
+    def cancel(self):
+        """Ask the running job to stop (checked before/after the solver)."""
+        self._cancel.set()
+
+    def start(self, target: Path, *, resolution: int = 2048,
+              padding: int = 4, vertices=None, faces=None):
+        if self._running:
+            return
+        self._cancel.clear()
+        self._running = True
+        self.state_changed.emit(True)
+        threading.Thread(
+            target=self._job,
+            args=(Path(target), int(resolution), int(padding),
+                  vertices, faces),
+            daemon=True).start()
+
+    def _job(self, target: Path, resolution: int, padding: int,
+             vertices, faces):
+        try:
+            # loaded fresh from disk every job (tools/ is hot-editable)
+            from tools._loader import load_tool
+            unwrap_arrays = load_tool("uv_unwrap").unwrap_arrays
+
+            if vertices is None or faces is None:
+                import trimesh
+
+                mesh = trimesh.load(str(target), force="mesh",
+                                    process=False)
+                if not isinstance(mesh, trimesh.Trimesh):
+                    raise ValueError(
+                        f"{target.name} did not load as one triangle mesh")
+                vertices = mesh.vertices
+                faces = mesh.faces
+            result = unwrap_arrays(
+                vertices, faces, resolution=resolution, padding=padding,
+                log=lambda message, level="info":
+                    self.log_line.emit(message, level),
+                cancel=self._cancel.is_set)
+            result["target_path"] = str(target)
+            self.uv_unwrap_done.emit(result)
+        except Exception as ex:
+            if self._cancel.is_set():
+                self.uv_unwrap_failed.emit("Unwrap UVs cancelled.")
+            else:
+                self.uv_unwrap_failed.emit(f"Unwrap UVs failed: {ex}")
+        finally:
+            self._running = False
+            self.state_changed.emit(False)
+
+
 class SubdivideController(QObject):
     """Catmull-Clark subdivision of the displayed mesh, in memory."""
 

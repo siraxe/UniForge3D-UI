@@ -214,6 +214,12 @@ class ModelViewer(QVTKRenderWindowInteractor):
         self._preset = "original"
         self._backface_cull = True
 
+        # bottom-right UV-shell outline overlay (toggled by the Outliner's
+        # "UV" button); hidden until first shown
+        self._uv_overlay_actor = None
+        self._uv_overlay_on = False
+        self._uv_overlay_segs = None
+
         # gray transparent "ghost" overlay (middle-click in the Outliner
         # list): a reference mesh shown next to the loaded one purely for
         # visual fit comparison; it is never picked, styled or exported
@@ -314,6 +320,17 @@ class ModelViewer(QVTKRenderWindowInteractor):
     @property
     def current_path(self) -> Path | None:
         return self._current_path
+
+    def set_display_path(self, path) -> None:
+        """Point :attr:`current_path` at *path* without loading it.
+
+        Used when the displayed content is an alternate variant of a file
+        (e.g. UltraTex's textured GLB shown on the 4th swatch): the Outliner
+        highlights it on the next refresh, while ``models`` bookkeeping
+        (texture source, edit history) keeps referencing the original mesh.
+        """
+        if path is not None:
+            self._current_path = Path(path)
 
     def toggle_draw_mode(self):
         """Q hotkey: flip the Outliner panel's Draw toggle.
@@ -547,6 +564,7 @@ class ModelViewer(QVTKRenderWindowInteractor):
             return False
 
         self._current_path = path
+        self._hide_uv_overlay()          # stale for the new model
         self._update_swatch_texture()    # also snapshots _model_actors
         if align_bounds is not None:
             self._align_model(align_bounds)
@@ -651,6 +669,179 @@ class ModelViewer(QVTKRenderWindowInteractor):
         for actor in actors:
             self._ren.AddActor(actor)
         return True
+    def smooth_model_normals(self) -> int:
+        """Maya-style smooth the displayed model's normals (the 'UV' button
+        in the Outliner). Returns the number of actors processed."""
+        actors = [a for a in self._polygroup_actors()
+                  if a.GetMapper() is not None]
+        self._smooth_actor_normals(actors)
+        self.render_now()
+        return len(actors)
+
+    # -- UV shell overlay (bottom-right corner of the 3D view) -------------
+    def toggle_uv_overlay(self, smooth: bool = True) -> str:
+        """'UV' button: show/hide the bottom-right UV-shell outline square.
+
+        Returns 'shown', 'hidden' or 'no-uvs'. When shown, the mesh's
+        normals are also smoothed (same button, on-demand pass).
+        """
+        if self._uv_overlay_on:
+            self._uv_overlay_on = False
+            if self._uv_overlay_actor is not None:
+                self._uv_overlay_actor.SetVisibility(False)
+            self.render_now()
+            return "hidden"
+        actors = [a for a in self._polygroup_actors()
+                  if a.GetMapper() is not None]
+        segs = self._uv_shell_lines(actors)
+        if segs is None:
+            return "no-uvs"
+        if smooth:
+            self._smooth_actor_normals(actors)
+        if self._uv_overlay_actor is None:
+            self._uv_overlay_actor = self._build_uv_overlay_actor()
+        if not self._ren.HasViewProp(self._uv_overlay_actor):
+            # clear() (model switch) runs RemoveAllViewProps, which unhooks
+            # the overlay actor; re-attach it before showing again
+            self._ren.AddActor(self._uv_overlay_actor)
+        self._uv_overlay_on = True
+        self._uv_overlay_segs = segs
+        self._rebuild_uv_overlay()
+        self._uv_overlay_actor.SetVisibility(True)
+        self.render_now()
+        return "shown"
+
+    @staticmethod
+    def _build_uv_overlay_actor() -> vtk.vtkActor2D:
+        """Transparent 2D line actor; polydata coords are viewport-normalized
+        (aspect-corrected), so it floats over the 3D view with no extra
+        renderer and no background fill."""
+        actor = vtk.vtkActor2D()
+        mapper = vtk.vtkPolyDataMapper2D()
+        coord = vtk.vtkCoordinate()
+        coord.SetCoordinateSystemToNormalizedViewport()
+        mapper.SetTransformCoordinate(coord)
+        actor.SetMapper(mapper)
+        prop = actor.GetProperty()
+        prop.SetColor(1.0, 1.0, 1.0)     # white outlines only
+        prop.SetLineWidth(1.0)
+        prop.SetOpacity(0.85)
+        return actor
+
+    @staticmethod
+    def _uv_shell_lines(actors) -> np.ndarray | None:
+        """UV-space shell outlines: edges used by exactly one UV triangle
+        (shell borders and holes). Returns [n,2,2] segments normalized into
+        a unit square (aspect kept), or None when no actor has UVs."""
+        segs = []
+        found_uvs = False
+        for actor in actors:
+            mapper = actor.GetMapper()
+            if mapper is None:
+                continue
+            poly = mapper.GetInput()
+            if poly is None or poly.GetNumberOfPolys() == 0:
+                continue
+            tc = poly.GetPointData().GetTCoords()
+            if tc is None or tc.GetNumberOfTuples() == 0:
+                continue
+            found_uvs = True
+            uv = np.asarray(vtk_to_numpy(tc), dtype=np.float64)[:, :2]
+            offsets = vtk_to_numpy(poly.GetPolys().GetOffsetsArray())
+            conn = vtk_to_numpy(poly.GetPolys().GetConnectivityArray())
+            sizes = np.diff(offsets)
+            if len(sizes) and sizes.min() == sizes.max() == 3:
+                tris = conn.reshape(-1, 3).astype(np.int64)
+            else:
+                fans = []
+                for s, e in zip(offsets[:-1], offsets[1:]):
+                    fan = conn[s:e]
+                    if len(fan) < 3:
+                        continue
+                    fans.append(np.stack(
+                        [np.full(len(fan) - 2, fan[0]), fan[1:-1], fan[2:]],
+                        axis=1))
+                if not fans:
+                    continue
+                tris = np.concatenate(fans, axis=0).astype(np.int64)
+            # undirected edge ids shared by exactly one UV triangle are the
+            # shell boundaries (interior edges are used exactly twice)
+            a, b = tris, np.roll(tris, -1, axis=1)
+            lo = np.minimum(a, b).ravel()
+            hi = np.maximum(a, b).ravel()
+            npts = np.uint64(max(len(uv), 1))
+            key = lo.astype(np.uint64) * npts + hi.astype(np.uint64)
+            _ukey, first, counts = np.unique(key, return_index=True,
+                                             return_counts=True)
+            bnd = counts == 1
+            if bnd.any():
+                segs.append(np.stack([uv[lo[first][bnd]],
+                                      uv[hi[first][bnd]]],
+                                     axis=1))
+        if not found_uvs:
+            return None
+        if not segs:
+            return np.zeros((0, 2, 2), dtype=np.float64)
+        segs = np.concatenate(segs, axis=0)
+        flat = segs.reshape(-1, 2)
+        mn, mx = flat.min(0), flat.max(0)
+        ext = max(float(mx[0] - mn[0]), float(mx[1] - mn[1]), 1e-9)
+        return ((segs - mn) / ext).astype(np.float64)
+
+    #: UV overlay square: fraction of the shorter canvas edge + margin px
+    _UV_OVERLAY_SIZE = 0.20
+    _UV_OVERLAY_MARGIN = 12
+
+    def _rebuild_uv_overlay(self):
+        """(Re)build the overlay polydata: square outline + UV shell lines,
+        anchored to the bottom-right corner of the 3D viewport."""
+        w, h = self._ren.GetSize()
+        if w <= 2 or h <= 2:
+            return
+        s = int(min(w, h) * self._UV_OVERLAY_SIZE)
+        x0, y0 = w - self._UV_OVERLAY_MARGIN - s, self._UV_OVERLAY_MARGIN
+        segs = getattr(self, "_uv_overlay_segs", None)
+        n_uv = 0 if segs is None else len(segs)
+        n = n_uv + 4                       # + square border (4 segments)
+        # segments in normalized viewport coords (divide by pixel dims so
+        # the square stays square at any window aspect)
+        pts = np.zeros((2 * n, 3), dtype=np.float64)   # vtkPoints: 3 comps
+        pts[:2 * n_uv, 0] = (x0 + segs.reshape(-1, 2)[:, 0] * s) / w
+        pts[:2 * n_uv, 1] = (y0 + segs.reshape(-1, 2)[:, 1] * s) / h
+        # square border: 4 segments from the closed loop (5 vertices)
+        sq = [(x0, y0), (x0 + s, y0), (x0 + s, y0 + s), (x0, y0 + s),
+              (x0, y0)]
+        pts[2 * n_uv:, 0] = [x / w
+                             for a, b in zip(sq[:-1], sq[1:])
+                             for x in (a[0], b[0])]
+        pts[2 * n_uv:, 1] = [y / h
+                             for a, b in zip(sq[:-1], sq[1:])
+                             for y in (a[1], b[1])]
+
+        poly = vtk.vtkPolyData()
+        poly.SetPoints(vtk.vtkPoints())
+        poly.GetPoints().SetData(numpy_to_vtk(pts, deep=True))
+        # VTK9 cell format: offsets only, connectivity is pure point ids
+        # (a per-cell count prefix here is read as a point id -> every
+        # segment gains a spur through vertex 2: the "star" artifact)
+        conn = np.empty((n, 2), dtype=np.int64)
+        conn[:, 0] = np.arange(0, 2 * n, 2)
+        conn[:, 1] = conn[:, 0] + 1
+        offsets = np.arange(0, 2 * n + 1, 2, dtype=np.int64)
+        cells = vtk.vtkCellArray()
+        cells.SetData(numpy_to_vtkIdTypeArray(offsets, deep=True),
+                      numpy_to_vtkIdTypeArray(conn.ravel(), deep=True))
+        poly.SetLines(cells)
+        mapper = self._uv_overlay_actor.GetMapper()
+        mapper.SetInputData(poly)
+        poly.Modified()
+
+    def _hide_uv_overlay(self):
+        """Turn the overlay off (model swap); does not need a re-render."""
+        self._uv_overlay_on = False
+        if self._uv_overlay_actor is not None:
+            self._uv_overlay_actor.SetVisibility(False)
+
     def _read_gltf_actors(self, path: Path) -> list:
         """Actors read from a GLB/glTF, detached from the importer.
 
@@ -658,18 +849,102 @@ class ModelViewer(QVTKRenderWindowInteractor):
         (e.g. EXT_texture_webp on older outputs).
         """
         actors = self._collect_importer_actors(self._gltf_importer(path))
-        if actors:
-            return actors
-        temp = self._export_via_trimesh(path)
-        if temp is None:
-            return []
-        try:
-            return self._collect_importer_actors(self._gltf_importer(temp))
-        finally:
-            try:  # VTK may still hold the file open briefly
-                temp.unlink(missing_ok=True)
-            except PermissionError:
-                pass
+        if not actors:
+            temp = self._export_via_trimesh(path)
+            if temp is None:
+                return []
+            try:
+                actors = self._collect_importer_actors(
+                    self._gltf_importer(temp))
+            finally:
+                try:  # VTK may still hold the file open briefly
+                    temp.unlink(missing_ok=True)
+                except PermissionError:
+                    pass
+        return actors
+
+    @staticmethod
+    def _smooth_actor_normals(actors) -> None:
+        """Maya-style averaged vertex normals on imported glTF actors.
+
+        glTF stores explicit normals; exporters write face-smoothed or even
+        per-face duplicated vertices, which render faceted. Face normals
+        here are averaged per unique *position* (across UV seams too, like
+        Maya's default normal averaging) and written back per point, so UV
+        layouts and vertex attributes are left untouched.
+        """
+        for actor in actors:
+            mapper = actor.GetMapper()
+            if mapper is None:
+                continue
+            poly = mapper.GetInput()
+            if poly is None or poly.GetNumberOfPolys() == 0 \
+                    or poly.GetNumberOfPoints() == 0:
+                continue
+            points = poly.GetPoints()
+            pts = np.asarray(vtk_to_numpy(points.GetData()),
+                             dtype=np.float64)
+            # polygon fan -> triangle soup. glTF exports pure triangles, so
+            # the common case is one vectorized reshape; the per-cell loop
+            # only runs for the rare non-triangle/n-gon polydata (a Python
+            # loop here costs seconds on multi-million-face meshes).
+            offsets = vtk_to_numpy(poly.GetPolys().GetOffsetsArray())
+            conn = vtk_to_numpy(poly.GetPolys().GetConnectivityArray())
+            if len(offsets) < 2 or len(conn) < 3:
+                continue
+            sizes = np.diff(offsets)
+            if len(sizes) and sizes.min() == sizes.max() == 3:
+                tris = conn.reshape(-1, 3).astype(np.int64)
+            else:
+                tris = []
+                for s, e in zip(offsets[:-1], offsets[1:]):
+                    fan = conn[s:e]
+                    if len(fan) < 3:
+                        continue
+                    tris.append(np.stack([np.full(len(fan) - 2, fan[0]),
+                                          fan[1:-1], fan[2:]], axis=1))
+                if not tris:
+                    continue
+                tris = np.concatenate(tris, axis=0)
+
+            # group points by (quantized) position so UV-seam duplicates
+            # share one averaged normal
+            diag = float(np.linalg.norm(pts.max(0) - pts.min(0)))
+            eps = max(diag * 1e-6, 1e-9)
+            keys = np.round(pts / eps).astype(np.int64)
+            uniq, inverse = np.unique(keys, axis=0, return_inverse=True)
+
+            fn = np.cross(pts[tris[:, 1]] - pts[tris[:, 0]],
+                          pts[tris[:, 2]] - pts[tris[:, 0]])
+            lens = np.linalg.norm(fn, axis=1)
+            good = lens > 1e-12                  # skip degenerate triangles
+            fn = fn[good]
+            tg = tris[good]
+            inv_good = inverse[tg]
+
+            # corner angle weights (the Maya / trimesh / Blender default):
+            # equalizes corners where face-split diagonals touch a vertex
+            weights = np.empty((len(tg), 3), dtype=np.float64)
+            for k in range(3):
+                e0 = pts[tg[:, (k + 1) % 3]] - pts[tg[:, k]]
+                e1 = pts[tg[:, (k + 2) % 3]] - pts[tg[:, k]]
+                l0 = np.maximum(np.linalg.norm(e0, axis=1), 1e-30)
+                l1 = np.maximum(np.linalg.norm(e1, axis=1), 1e-30)
+                cosang = np.clip((e0 * e1).sum(1) / (l0 * l1), -1.0, 1.0)
+                weights[:, k] = np.arccos(cosang)
+
+            acc = np.zeros((len(uniq), 3), dtype=np.float64)
+            for k in range(3):
+                np.add.at(acc, inv_good[:, k], fn * weights[:, k, None])
+            norms = np.linalg.norm(acc, axis=1)
+            ok = norms > 1e-12
+            acc[ok] /= norms[ok, None]
+
+            smooth = acc[inverse]                # one normal per point
+            arr = numpy_to_vtk(np.ascontiguousarray(smooth), deep=True)
+            arr.SetName("Normals")
+            poly.GetPointData().SetNormals(arr)
+            poly.Modified()
     @staticmethod
     def _gltf_importer(path: Path):
         importer = vtk.vtkGLTFImporter()
@@ -761,8 +1036,10 @@ class ModelViewer(QVTKRenderWindowInteractor):
         return self._actors_bounds(self._model_actors)
 
     def _mesh_stats(self):
-        """Total (vertices, triangles) across the primary model actors."""
+        """Total (vertices, triangles, has-uvs) across the primary model
+        actors."""
         verts = tris = 0
+        has_uvs = False
         for actor in self._model_actors:
             mapper = actor.GetMapper()
             if mapper is None:
@@ -772,17 +1049,21 @@ class ModelViewer(QVTKRenderWindowInteractor):
                 continue
             verts += pd.GetNumberOfPoints()
             tris += pd.GetNumberOfPolys()
-        return verts, tris
+            tcoords = pd.GetPointData().GetTCoords()
+            if tcoords is not None and tcoords.GetNumberOfTuples() > 0:
+                has_uvs = True
+        return verts, tris, has_uvs
 
     def _update_info_text(self):
-        """Refresh the top-left overlay (name / verts / faces) or hide it."""
+        """Refresh the top-left overlay (name / verts / faces / uvs)."""
         if self._current_path is None:
             self._info.SetText(vtk.vtkCornerAnnotation.UpperLeft, "")
             return
-        verts, faces = self._mesh_stats()
+        verts, faces, has_uvs = self._mesh_stats()
         text = (f"{self._current_path.name}\n"
                 f"  verts: {verts:,}\n"
-                f"  tris: {faces:,}")
+                f"  tris: {faces:,}\n"
+                f"  UVs: {'Yes' if has_uvs else 'No'}")
         if self._selection_count:
             text += f"\n  sel: {self._selection_count:,}"
         if self._polygroups.used_count:
@@ -890,6 +1171,10 @@ class ModelViewer(QVTKRenderWindowInteractor):
         super().resizeEvent(event)
         if hasattr(self, "_swatch_ren"):
             self._fit_swatches()
+        if getattr(self, "_uv_overlay_on", False) \
+                and self._uv_overlay_actor is not None:
+            self._rebuild_uv_overlay()
+        if hasattr(self, "_swatch_ren"):
             self.render_now()
 
     def showEvent(self, event):

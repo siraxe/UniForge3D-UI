@@ -6,11 +6,14 @@ from pathlib import Path
 from PySide6.QtCore import QEvent, QPoint, QPointF, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QPainter, QPixmap
 from PySide6.QtWidgets import (
-    QGridLayout, QLabel, QPushButton, QSizePolicy, QToolButton,
+    QGridLayout, QLabel, QMenu, QPushButton, QSizePolicy, QToolButton,
     QVBoxLayout, QWidget,
 )
 
 THUMB_SIZE = 48
+
+#: canonical view names offered in the thumbnail context menu
+VIEW_NAMES = ("front", "left", "right", "top", "bottom", "back")
 
 
 # ---------------------------------------------------------------------------
@@ -57,7 +60,9 @@ class _ImagePreview(QWidget):
         x = top_left.x() + anchor.width() + 10
         if x + self.width() > geo.right() + 1:
             x = top_left.x() - self.width() - 10
-        y = top_left.y() + (anchor.height() - self.height()) // 2
+        # vertical center, pushed ~30% of the popup height further down
+        y = top_left.y() + (anchor.height() - self.height()) // 2 \
+            + int(self.height() * 0.3)
         x = max(geo.left() + 4, min(x, geo.right() - self.width() - 3))
         y = max(geo.top() + 4, min(y, geo.bottom() - self.height() - 3))
         self.move(x, y)
@@ -68,6 +73,7 @@ class _Thumb(QWidget):
 
     remove = Signal(object)                      # carries the Path
     selected = Signal(object)                    # carries the Path
+    viewChanged = Signal(object, str)            # Path + view name ("" = clear)
 
     def __init__(self, path: Path, size: int = THUMB_SIZE,
                  border: str | None = None, removable: bool = True,
@@ -81,7 +87,7 @@ class _Thumb(QWidget):
         self._preview: _ImagePreview | None = None
         self._hover_timer = QTimer(self)
         self._hover_timer.setSingleShot(True)
-        self._hover_timer.setInterval(250)   # brief dwell avoids popup flashes
+        self._hover_timer.setInterval(600)   # longer dwell avoids popup flashes
         self._hover_timer.timeout.connect(self._show_preview)
 
         pixmap = QPixmap(str(path))
@@ -111,6 +117,16 @@ class _Thumb(QWidget):
         self._label.installEventFilter(self)
         self._badge.installEventFilter(self)
 
+        # Green view tag (front/left/...) in the top-left corner.
+        self._view_badge = QLabel("", self)
+        self._view_badge.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self._view_badge.setStyleSheet(
+            "QLabel { color: #4caf50; font-size: 8px; font-weight: bold;"
+            "  background: rgba(0,0,0,55%); padding: 1px 3px;"
+            "  border-radius: 3px; }")
+        self._view_badge.hide()
+        lay.addWidget(self._view_badge, 0, 0, Qt.AlignTop | Qt.AlignLeft)
+
         if removable:
             btn = QToolButton(self)
             btn.setText("x")
@@ -121,10 +137,10 @@ class _Thumb(QWidget):
                 "QToolButton:hover { background: rgba(180,50,50,90%); }")
             btn.clicked.connect(lambda: self.remove.emit(self.path))
             lay.addWidget(btn, 0, 0, Qt.AlignTop | Qt.AlignRight)
-        self._base_tip = "Click to select as REF"
         if selectable:
             self.setCursor(Qt.PointingHandCursor)
-            self.setToolTip(self._base_tip)
+            # no native tooltip: the hover preview takes over on dwell
+            self.setToolTip("")
         self._apply_style()
 
     def _apply_style(self):
@@ -139,19 +155,46 @@ class _Thumb(QWidget):
     def set_selected(self, selected: bool):
         self._selected = bool(selected)
         self._apply_style()
-        # While selected, suppress the native tooltip so it cannot pop up on
-        # top of the large preview; the hover preview takes over.
-        self.setToolTip("" if self._selected else self._base_tip)
-        if not self._selected:
-            self._hide_preview()
-        elif self.underMouse():
-            # Selected via click without moving the cursor: behave as if the
-            # cursor had just entered the tile.
-            self._hover_timer.start()
+        # Suppress the native tooltip on selectable tiles: the hover preview
+        # takes over and must not pop up under it.
+        self.setToolTip("")
 
-    # -- hover preview for the selected REF image -------------------------
+    def set_view_label(self, view: str | None):
+        """Show the assigned view name in the top-left corner (or hide it)."""
+        if view:
+            self._view_badge.setText(view.upper())
+            self._view_badge.adjustSize()
+            self._view_badge.show()
+        else:
+            self._view_badge.hide()
+
+    def contextMenuEvent(self, event):
+        menu = QMenu(self)
+        actions = {}
+        # Views already assigned to OTHER images are grayed out: one ref
+        # per view (this tile's own view stays enabled so it can be re-set).
+        taken = set()
+        state = getattr(self.window(), "app_state", None)
+        if state is not None:
+            taken = {v for p, v in state.view_map.items() if p != self.path}
+        for name in VIEW_NAMES:
+            action = menu.addAction(name.capitalize())
+            action.setEnabled(name not in taken)
+            actions[action] = name
+        menu.addSeparator()
+        clear_action = menu.addAction("Clear")
+        clear_action.setEnabled(bool(self._view_badge.isVisible()))
+        chosen = menu.exec(event.globalPos())
+        if chosen is None:
+            return
+        if chosen is clear_action:
+            self.viewChanged.emit(self.path, "")
+        else:
+            self.viewChanged.emit(self.path, actions[chosen])
+
+    # -- hover preview (any hovered selectable thumbnail) ------------------
     def _show_preview(self):
-        if not (self._selectable and self._selected and self.isVisible()):
+        if not (self._selectable and self.isVisible()):
             return
         if self._preview is None:
             self._preview = _ImagePreview(self.path, self)
@@ -163,7 +206,7 @@ class _Thumb(QWidget):
 
     def enterEvent(self, event):
         super().enterEvent(event)
-        if self._selectable and self._selected:
+        if self._selectable:
             self._hover_timer.start()
 
     def leaveEvent(self, event):

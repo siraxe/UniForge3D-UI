@@ -1,11 +1,16 @@
 """Shared application and action state."""
 
+import json
 from dataclasses import dataclass
 from pathlib import Path
 
 from PySide6.QtCore import QObject, Signal
 
 from paths import IMAGE_SUFFIXES
+
+
+VIEW_NAMES = ("front", "left", "right", "top", "bottom", "back")
+VIEWS_FILENAME = "reference_views.json"
 
 
 class AppState(QObject):
@@ -19,7 +24,17 @@ class AppState(QObject):
         self.image_paths: list[Path] = []
         self.cutout_map: dict[Path, Path] = {}
         self.ref_reference: Path | None = None
+        #: path -> one of VIEW_NAMES ("front", "left", ...) or "clear" absent
+        self.view_map: dict[Path, str] = {}
+        #: folder the images were loaded from (persist view tags there)
+        self.project_dir: Path | None = None
         self.last_seed: int | None = None
+
+    @property
+    def reference_views(self) -> list[tuple[Path, str]]:
+        """[(path, view), ...] for images with an assigned view."""
+        return [(p, v) for p, v in self.view_map.items()
+                if p in self.image_paths]
 
     def add_images(self, paths) -> bool:
         added = False
@@ -34,10 +49,12 @@ class AppState(QObject):
 
     def clear(self):
         if (not self.image_paths and not self.cutout_map
-                and self.ref_reference is None):
+                and self.ref_reference is None and not self.view_map):
             return
         self.image_paths.clear()
         self.cutout_map.clear()
+        self.view_map.clear()
+        self.project_dir = None
         self.ref_reference = None
         self.changed.emit()
 
@@ -47,12 +64,62 @@ class AppState(QObject):
         if removed:
             self.image_paths.remove(path)
         self.cutout_map.pop(path, None)
+        self.view_map.pop(path, None)
         if path == self.ref_reference:
             self.ref_reference = None
             removed = True
         if removed:
+            self._save_current_views()
             self.changed.emit()
         return removed
+
+    def set_view(self, path, view: str | None) -> bool:
+        """Assign a reference view to an image; None clears it."""
+        path = Path(path)
+        if path not in self.image_paths:
+            return False
+        if view:
+            view = view.lower()
+            if view not in VIEW_NAMES or self.view_map.get(path) == view:
+                return False
+            self.view_map[path] = view
+        elif path not in self.view_map:
+            return False
+        else:
+            del self.view_map[path]
+        self._save_current_views()
+        self.changed.emit()
+        return True
+
+    def _save_current_views(self):
+        """Persist view tags to the project folder immediately (if any)."""
+        if self.project_dir is None:
+            return
+        mapping = {p.name: v for p, v in self.view_map.items()
+                   if p.parent == self.project_dir}
+        self.save_views(self.project_dir, mapping)
+
+    def save_views(self, inputs_dir: Path, mapping: dict[str, str]) -> bool:
+        """Write ``{filename: view}`` into *inputs_dir* as JSON.
+
+        *mapping* keys are image file names relative to the folder. Returns
+        True when the file was written. An empty mapping removes a stale
+        file instead."""
+        inputs_dir = Path(inputs_dir)
+        if not mapping:
+            try:
+                (inputs_dir / VIEWS_FILENAME).unlink(missing_ok=True)
+            except OSError:
+                pass
+            return False
+        try:
+            inputs_dir = Path(inputs_dir)
+            inputs_dir.mkdir(parents=True, exist_ok=True)
+            (inputs_dir / VIEWS_FILENAME).write_text(
+                json.dumps(mapping, indent=2), encoding="utf-8")
+            return True
+        except (OSError, TypeError):
+            return False
 
     def set_reference(self, path) -> bool:
         path = Path(path)
@@ -92,7 +159,10 @@ class AppState(QObject):
             return None
         self.image_paths = list(files)
         self.cutout_map.clear()
+        self.view_map.clear()
+        self.project_dir = search
         self.ref_reference = None
+        restored_views = self._load_views(search, files)
         restored = 0
         for src in files:
             # _copy_input_images stores sources as <stem>_src.png next to
@@ -106,6 +176,28 @@ class AppState(QObject):
         self.changed.emit()
         return len(files), restored, inputs_dir.is_dir()
 
+    def _load_views(self, search: Path, files: list[Path]) -> int:
+        """Restore view tags from ``reference_views.json`` next to the images.
+
+        Returns the number of restored assignments."""
+        views_file = search / VIEWS_FILENAME
+        if not views_file.is_file():
+            return 0
+        try:
+            saved = json.loads(views_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return 0
+        if not isinstance(saved, dict):
+            return 0
+        present = set(files)
+        for name, view in saved.items():
+            if not isinstance(view, str) or view not in VIEW_NAMES:
+                continue
+            path = search / name
+            if path in present:
+                self.view_map[path] = view
+        return len(self.view_map)
+
 
 @dataclass(frozen=True)
 class ActionState:
@@ -116,6 +208,7 @@ class ActionState:
     refining: bool = False
     lato2: bool = False
     repairing: bool = False
+    utex: bool = False
     reprojecting: bool = False
     polishing: bool = False
     remeshing: bool = False
@@ -136,7 +229,8 @@ class ActionState:
     @property
     def idle(self) -> bool:
         return not (self.busy or self.cutting or self.refining
-                    or self.lato2 or self.repairing or self.edit_running)
+                    or self.lato2 or self.repairing or self.utex
+                    or self.edit_running)
 
     @property
     def edit_running(self) -> bool:
@@ -154,6 +248,9 @@ class ActionState:
             return "Running: LATO.2 mesh generation"
         if self.repairing:
             return "Running: CelloCut watertight repair"
+        if self.utex:
+            return {"utexws": "Running: WS normal bake"}.get(
+                self.pending_kind, "Running: UltraTex texturing")
         if self.reprojecting:
             return "Running: detail reprojection"
         if self.mirroring:

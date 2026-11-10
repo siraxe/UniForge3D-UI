@@ -16,6 +16,7 @@ RMBG_WORKER = _WORKERS / "rmbg_worker.py"
 HI3D_WORKER = _WORKERS / "hi3d_worker.py"
 CELLO_WORKER = _WORKERS / "cello_worker.py"
 LATO2_WORKER = _WORKERS / "lato2_worker.py"
+ULTRATEX_WORKER = _WORKERS / "ultratex_worker.py"
 MODEL_DIR = find_model_dir()
 OUTPUT_DIR = ROOT / "output_dir"
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}
@@ -134,3 +135,7 @@ def _cellocut_source_path(glb: Path) -> Path | None:
 def _edit_output_path(glb: Path) -> Path:
     stem = re.sub(r"(_edit|_reproject)$", "", glb.stem)
     return glb.with_name(stem + "_edit.glb")
+
+
+def _ultratex_output_dir(glb: Path) -> Path:
+    return glb.with_name(glb.stem + "_ultratex")

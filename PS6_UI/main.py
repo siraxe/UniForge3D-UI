@@ -94,7 +94,7 @@ from app.jobs import JobCoordinator
 from app.models import ModelLibrary
 from app.pipeline import Pipeline
 from panels import LeftPanel, OutlinerPanel, RightPanel
-from utils.theme import DARK_PALETTE, SPLITTER_STYLE
+from utils.theme import DARK_PALETTE, SPLITTER_STYLE, apply_tooltip_font
 from dialogs import SettingsDialog, app_settings as _app_settings
 
 # ---------------------------------------------------------------------------
@@ -106,6 +106,7 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("UniForge3D - image to 3D")
         self.resize(1500, 900)
         self.setPalette(DARK_PALETTE)
+        apply_tooltip_font()
 
         self.app_state = AppState(self)
         self._build_jobs()
@@ -179,6 +180,8 @@ class MainWindow(QMainWindow):
             self.left_panel._update_seed_button)
         self.jobs.remesh_progress.connect(
             self.right_panel.on_remesh_progress)
+        self.jobs.ultratex.log_line.connect(
+            self.right_panel.on_ultratex_status)
         self.jobs.cutout_ready.connect(self.pipeline.on_cutout_ready)
         self.jobs.rmbg_finished.connect(self.pipeline.on_rmbg_finished)
         self.jobs.generation_done.connect(self.pipeline.on_generation_done)
@@ -190,6 +193,9 @@ class MainWindow(QMainWindow):
         self.jobs.lato2_failed.connect(self.pipeline.on_lato2_failed)
         self.jobs.cellocut_done.connect(self.pipeline.on_cellocut_done)
         self.jobs.cellocut_failed.connect(self.pipeline.on_cellocut_failed)
+        self.jobs.ultratex_done.connect(self.pipeline.on_ultratex_done)
+        self.jobs.ultratex_ws_done.connect(self.pipeline.on_ws_normal_done)
+        self.jobs.ultratex_failed.connect(self.pipeline.on_ultratex_failed)
 
     def _on_images_changed(self):
         self.left_panel.rebuild_thumbs()
@@ -338,6 +344,7 @@ class MainWindow(QMainWindow):
             refining=self.jobs.hi3d.refining,
             lato2=self.jobs.lato2.running,
             repairing=self.jobs.cellocut.running,
+            utex=self.jobs.ultratex.running,
             reprojecting=self.jobs.reproject.running,
             polishing=self.jobs.polish.running,
             remeshing=self.jobs.remesh.running,

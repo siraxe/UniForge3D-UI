@@ -7,12 +7,13 @@ from PySide6.QtCore import QObject, Signal
 from paths import OUTPUT_DIR
 from workers.controllers import (
     CelloCutController, Hi3DController, Lato2Controller, ObjConverter,
+    UltraTexController,
     RmbgController, WorkerController,
 )
 from workers.edit_tools import (
     CloseHolesController, DecimateController, DeleteFacesController,
     MirrorMergeController, PolishController, RemeshController,
-    ReprojectController, SubdivideController,
+    ReprojectController, SubdivideController, UVUnwrapController,
 )
 
 
@@ -32,6 +33,9 @@ class JobCoordinator(QObject):
     lato2_failed = Signal(str)
     cellocut_done = Signal(object)
     cellocut_failed = Signal(str)
+    ultratex_done = Signal(object)
+    ultratex_ws_done = Signal(object)
+    ultratex_failed = Signal(str)
     edit_done = Signal(str, object)
     edit_failed = Signal(str, str)
 
@@ -42,6 +46,7 @@ class JobCoordinator(QObject):
         self.hi3d = Hi3DController(self)
         self.lato2 = Lato2Controller(self)
         self.cellocut = CelloCutController(self)
+        self.ultratex = UltraTexController(self)
         self.rmbg = RmbgController(OUTPUT_DIR / ".cutouts", self)
         self.reproject = ReprojectController(self)
         self.polish = PolishController(self)
@@ -51,12 +56,14 @@ class JobCoordinator(QObject):
         self.close_holes = CloseHolesController(self)
         self.delete_faces = DeleteFacesController(self)
         self.mirror_merge = MirrorMergeController(self)
+        self.uv_unwrap = UVUnwrapController(self)
 
         self.converter.log_line.connect(self.log)
         for ctrl in (self.worker, self.hi3d, self.lato2, self.cellocut,
+                     self.ultratex,
                      self.reproject, self.polish, self.remesh, self.decimate,
                      self.subdivide, self.close_holes, self.delete_faces,
-                     self.mirror_merge):
+                     self.mirror_merge, self.uv_unwrap):
             ctrl.log_line.connect(self.log)
             ctrl.state_changed.connect(self._state_changed)
         self.rmbg.log_line.connect(lambda msg: self.log.emit(msg, "info"))
@@ -71,6 +78,10 @@ class JobCoordinator(QObject):
         self.lato2.lato2_done.connect(self._on_lato2_done)
         self.lato2.lato2_failed.connect(self._on_lato2_failed)
         self.cellocut.cut_done.connect(self._on_cellocut_done)
+        self.ultratex.log_line.connect(self.log.emit)
+        self.ultratex.state_changed.connect(self._state_changed)
+        self.ultratex.utex_done.connect(self._on_ultratex_done)
+        self.ultratex.utex_failed.connect(self._on_ultratex_failed)
         self.cellocut.cut_failed.connect(self._on_cellocut_failed)
         self.remesh.progress.connect(self.remesh_progress)
 
@@ -84,6 +95,7 @@ class JobCoordinator(QObject):
             self._on_delete_faces_done)
         self.mirror_merge.mirror_merge_done.connect(
             self._on_mirror_merge_done)
+        self.uv_unwrap.uv_unwrap_done.connect(self._on_uv_unwrap_done)
         for ctrl, failed, label in (
             (self.reproject, "reproject_failed", "Reproject"),
             (self.polish, "polish_failed", "Polish"),
@@ -94,6 +106,7 @@ class JobCoordinator(QObject):
             (self.delete_faces, "delete_faces_failed", "Delete hidden"),
             (self.mirror_merge, "mirror_merge_failed",
              "Mirror and merge"),
+            (self.uv_unwrap, "uv_unwrap_failed", "Unwrap UVs"),
         ):
             getattr(ctrl, failed).connect(
                 lambda msg, label=label: self.edit_failed.emit(label, msg))
@@ -110,11 +123,12 @@ class JobCoordinator(QObject):
         """True while any generation, repair or edit controller runs."""
         return (self.worker.generating or self.rmbg.running
                 or self.hi3d.refining or self.lato2.running
-                or self.cellocut.running
+                or self.cellocut.running or self.ultratex.running
                 or any(ctrl.running for ctrl in (
                     self.reproject, self.polish, self.remesh,
                     self.decimate, self.subdivide, self.close_holes,
-                    self.delete_faces, self.mirror_merge)))
+                    self.delete_faces, self.mirror_merge,
+                    self.uv_unwrap)))
 
     def begin(self, kind: str, state_path: Path | None = None,
               images: list[Path] | None = None):
@@ -140,7 +154,7 @@ class JobCoordinator(QObject):
 
     def shutdown(self):
         for ctrl in (self.rmbg, self.hi3d, self.lato2, self.cellocut,
-                     self.worker):
+                     self.ultratex, self.worker):
             ctrl.shutdown()
 
     def _state_changed(self, _busy):
@@ -194,6 +208,23 @@ class JobCoordinator(QObject):
     def _on_cellocut_failed(self, msg: str):
         self.clear_pending()
         self.cellocut_failed.emit(msg)
+
+    def _on_ultratex_done(self, output, seed=None, stats=None):
+        self.clear_pending()
+        stats = dict(stats) if isinstance(stats, dict) else {}
+        if stats.get("kind") == "ws_normal":
+            self.ultratex_ws_done.emit({"output": Path(output),
+                                        "stats": stats})
+            return
+        self.ultratex_done.emit({
+            "output": Path(output),
+            "seed": seed,
+            "stats": stats,
+        })
+
+    def _on_ultratex_failed(self, msg: str):
+        self.clear_pending()
+        self.ultratex_failed.emit(msg)
 
     def _on_rmbg_finished(self, code: int):
         self.rmbg_finished.emit(code)
@@ -284,6 +315,26 @@ class JobCoordinator(QObject):
             f"{result.get('backend', '?')}) in "
             f"{result.get('seconds', 0):.1f}s.", "ok")
         self.edit_done.emit(result.get("mode_label", "Decimate"), result)
+
+    def _on_uv_unwrap_done(self, result):
+        result = result or {}
+        try:
+            vertices = result["vertices"]
+            faces = result["faces"]
+            uvs = result["uvs"]
+        except (KeyError, TypeError):
+            self.edit_failed.emit("Unwrap UVs",
+                                  "Unwrap UVs returned no UV geometry.")
+            return
+        self.log.emit(
+            f"UV unwrap finished: {result.get('chart_count', 0)} charts on "
+            f"a {result.get('atlas_resolution', '?')}px atlas "
+            f"({result.get('atlas_utilization_percent', 0)}% used, "
+            f"{result.get('input_vertex_count', 0):,} -> "
+            f"{result.get('vertex_count', 0):,} vertices after seam splits) "
+            f"in {result.get('seconds', 0):.1f}s. The UVs are kept in the "
+            "unsaved edit; Save/Bake writes them as TEXCOORD_0.", "ok")
+        self.edit_done.emit(result.get("mode_label", "Unwrap UVs"), result)
 
     def _on_subdivide_done(self, result):
         result = result or {}

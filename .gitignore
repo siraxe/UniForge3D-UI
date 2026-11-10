@@ -23,6 +23,9 @@ __pycache__/
 !/output_dir/.gitkeep
 /model
 /models/
+/submodules/ComfyUI/
 /flet_UI
 /uniforge3d_orig
 /assets
+*.glb
+*.png

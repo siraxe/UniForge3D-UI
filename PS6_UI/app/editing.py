@@ -245,6 +245,25 @@ class EditSession(QObject):
                                  vertices=vertices, faces=faces)
         self.changed.emit()
 
+    def run_uv_unwrap(self, *, resolution, padding):
+        loaded = self._target("Unwrap UVs")
+        if loaded is None:
+            return
+        vertices, faces = as_triangles(*self.arrays_for(loaded))
+        if vertices is not None:
+            self.log.emit("Unwrap UVs: using the current unsaved in-memory "
+                          "edit as input; earlier changes are kept.", "info")
+        self.log.emit(f"Unwrap UVs on {loaded.name}: xatlas atlas "
+                      f"{resolution}px, padding {padding} texels; UV seams "
+                      "duplicate vertices, so the output topology changes "
+                      "and the result (UVs included) stays in memory until "
+                      "Save. Run this as the last geometry step before "
+                      "texturing.", "info")
+        self.jobs.uv_unwrap.start(loaded, resolution=int(resolution),
+                                  padding=int(padding),
+                                  vertices=vertices, faces=faces)
+        self.changed.emit()
+
     def run_subdivide(self):
         loaded = self._target("Subdivide")
         if loaded is None:
@@ -379,7 +398,8 @@ class EditSession(QObject):
                            ("Close holes", self.jobs.close_holes),
                            ("Delete hidden", self.jobs.delete_faces),
                            ("Mirror and merge", self.jobs.mirror_merge),
-                           ("Remesh", self.jobs.remesh)):
+                           ("Remesh", self.jobs.remesh),
+                           ("Unwrap UVs", self.jobs.uv_unwrap)):
             if ctrl.running:
                 ctrl.cancel()
                 self.log.emit(f"{name}: stop requested; waiting for the "
@@ -495,6 +515,7 @@ class EditSession(QObject):
 
             stats = load_tool("reproject").save_reprojected(
                 source, output, vertices, faces,
+                uvs=edit.get("uvs"),
                 log=lambda message, level="info":
                     self.log.emit(message, level))
         except Exception as ex:  # noqa: BLE001 - report in the UI
@@ -505,8 +526,13 @@ class EditSession(QObject):
         self._smooth_bake_logged = False
         self.changed.emit()
         if not stats.get("preserved_material", True):
-            self.log.emit("Save: topology changed, so the original "
-                          "UVs/material could not be carried over.", "warn")
+            if stats.get("uv_written"):
+                self.log.emit("Save: unwrapped UV atlas written as "
+                              "TEXCOORD_0.", "info")
+            else:
+                self.log.emit("Save: topology changed, so the original "
+                              "UVs/material could not be carried over.",
+                              "warn")
         if self.viewer.load(output, preserve_camera=True,
                             preserve_material=True):
             self.saved.emit(output, True)

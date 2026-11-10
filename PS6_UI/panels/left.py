@@ -304,7 +304,9 @@ class LeftPanel(QWidget):
             thumb = _Thumb(path, removable=True, selectable=True)
             thumb.remove.connect(self._remove_image)
             thumb.selected.connect(self._on_reference_selected)
+            thumb.viewChanged.connect(self._on_view_changed)
             thumb.set_selected(path == win.app_state.ref_reference)
+            thumb.set_view_label(win.app_state.view_map.get(path))
             self.thumb_list.setItemWidget(item, thumb)
         self._rebuild_cutouts()
         win._refresh_buttons()
@@ -340,7 +342,14 @@ class LeftPanel(QWidget):
     def _on_reference_selected(self, path):
         win = self.win
         path = Path(path)
-        if path not in win.app_state.image_paths or path == win.app_state.ref_reference:
+        if path not in win.app_state.image_paths:
+            return
+        if path == win.app_state.ref_reference:
+            # clicking the REF thumbnail again unselects it
+            win.app_state.ref_reference = None
+            self._update_reference_markers()
+            win.log("Reference cleared.", "info")
+            win._refresh_buttons()
             return
         win.app_state.ref_reference = path
         self._update_reference_markers()
@@ -350,7 +359,21 @@ class LeftPanel(QWidget):
         win.log(f"Reference image: {path.name}{note}.", "ok")
         win._refresh_buttons()
 
+    def _on_view_changed(self, path, view: str):
+        win = self.win
+        applied = win.app_state.set_view(path, view or None)
+        if applied:
+            name = view or "cleared"
+            win.log(f"Reference view for {Path(path).name}: {name}.", "ok")
+        self._update_reference_markers()
+
     def _update_reference_markers(self):
+        for i in range(self.thumb_list.count()):
+            widget = self.thumb_list.itemWidget(self.thumb_list.item(i))
+            if isinstance(widget, _Thumb):
+                widget.set_selected(widget.path == self.win.app_state.ref_reference)
+                widget.set_view_label(
+                    self.win.app_state.view_map.get(widget.path))
         for i in range(self.thumb_list.count()):
             widget = self.thumb_list.itemWidget(self.thumb_list.item(i))
             if isinstance(widget, _Thumb):
@@ -368,7 +391,8 @@ class LeftPanel(QWidget):
             widget.setEnabled(upscale_on)
         self.upscale_scene.setEnabled(state.has_model)
         self.btn_stop.setEnabled(state.busy or state.refining
-                                 or state.lato2 or state.repairing)
+                                 or state.lato2 or state.repairing
+                                 or state.utex)
         self.btn_rmbg.setEnabled(state.idle and state.has_images)
         self.low_vram_check.setEnabled(state.idle)
         self.stop_stage1_check.setEnabled(state.idle)

@@ -17,6 +17,7 @@ from paths import (
     HI3D_WORKER,
     CELLO_WORKER,
     LATO2_WORKER,
+    ULTRATEX_WORKER,
     MODEL_DIR,
 )
 
@@ -53,9 +54,11 @@ class _WorkerReader(QThread):
                 elif kind == "done":
                     # "scale_back" is produced by the stage2 job; other jobs
                     # leave it absent, so the payload is simply None.
+                    extra = (msg.get("scale_back")
+                             if "scale_back" in msg else msg.get("stats"))
                     self.job_done.emit(str(msg.get("output", "")),
                                        msg.get("seed"),
-                                       msg.get("scale_back"))
+                                       extra)
                 elif kind == "error":
                     self.job_failed.emit(str(msg.get("msg", "")))
                 elif kind == "ready":
@@ -841,3 +844,150 @@ class ObjConverter(QObject):
             self.log_line.emit(f"OBJ conversion failed: {ex}", "error")
         finally:
             self._busy = False
+
+
+class UltraTexController(QObject):
+    """One-shot UltraTex texturing worker (FLUX.2 Klein 9B int8-convrot)."""
+
+    log_line = Signal(str, str)
+    state_changed = Signal(bool)         # True while texturing
+    utex_done = Signal(str, object, object)   # textured glb, seed, stats
+    utex_failed = Signal(str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._proc: subprocess.Popen | None = None
+        self._reader: _WorkerReader | None = None
+        self._running = False
+
+    @property
+    def running(self) -> bool:
+        return self._running
+
+    def _spawn_send(self, cmd: dict):
+        """Spawn the one-shot worker and queue *cmd* on its stdin."""
+        if self._running:
+            return
+        # A finished one-shot worker may still be shutting down; reap it
+        # before spawning the next run.
+        if self._proc is not None and self._proc.poll() is None:
+            self.stop()
+        self._proc = subprocess.Popen(
+            [sys.executable, str(ULTRATEX_WORKER),
+             "--model-dir", str(MODEL_DIR)],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            text=True, encoding="utf-8", bufsize=1, cwd=str(ROOT),
+        )
+        self._reader = _WorkerReader(self._proc, self)
+        self._reader.log_line.connect(self.log_line)
+        self._reader.job_done.connect(self._on_done)
+        self._reader.job_failed.connect(self._on_failed)
+        self._reader.worker_dead.connect(self._on_dead)
+        self._reader.reader_finished.connect(self._on_reader_finished)
+        self._reader.start()
+        self._proc.stdin.write(json.dumps(cmd) + '\n')
+        self._proc.stdin.flush()
+        self._running = True
+        self.state_changed.emit(True)
+
+    def start(self, mesh: Path, reference: Path, *, mask=None,
+              seed=None, steps: int = 8, render_size: int = 2048,
+              bake_size: int = 4096, use_pbr: bool = True,
+              use_refine: bool = True, use_second_rig: bool = True,
+              use_distill_lora: bool = True, render_mesh: Path | None = None,
+              reference_views: dict | None = None):
+        cmd = {
+            "cmd": "texture",
+            "mesh": str(mesh),
+            "reference": str(reference),
+            "seed": seed,
+            "steps": int(steps),
+            "render_size": int(render_size),
+            "bake_size": int(bake_size),
+            "use_pbr": bool(use_pbr),
+            "use_refine": bool(use_refine),
+            "use_second_rig": bool(use_second_rig),
+            "use_distill_lora": bool(use_distill_lora),
+        }
+        if mask is not None:
+            cmd["mask"] = str(mask)
+        if render_mesh is not None:
+            cmd["render_mesh"] = str(render_mesh)
+        if reference_views:
+            cmd["reference_views"] = {view: str(path) for view, path
+                                      in reference_views.items()}
+        self._spawn_send(cmd)
+
+    def bake_ws(self, mesh: Path, donor: Path, *, resolution: int = 4096):
+        """World-space normal bake: the displayed mesh is the low-poly
+        target, the circle-marked mesh is the high-poly source. Uses only
+        the comfy-core mesh tools (no FLUX model load)."""
+        self._spawn_send({
+            "cmd": "bake_ws_normal",
+            "mesh": str(mesh),
+            "donor": str(donor),
+            "resolution": int(resolution),
+        })
+
+    def stop(self):
+        """Hard-kill the worker; a stopped run leaves partial atlases on
+        disk (the engine writes them as it goes) but no edited state."""
+        if self._proc is None and self._reader is None:
+            return
+        proc, self._proc = self._proc, None
+        if self._reader is not None:
+            for signal, slot in (
+                (self._reader.job_done, self._on_done),
+                (self._reader.job_failed, self._on_failed),
+                (self._reader.worker_dead, self._on_dead),
+                (self._reader.reader_finished, self._on_reader_finished),
+            ):
+                try:
+                    signal.disconnect(slot)
+                except (RuntimeError, TypeError):
+                    pass
+        if proc is not None and proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        self._reap_reader()
+        self._running = False
+        self.state_changed.emit(False)
+
+    def shutdown(self):
+        self.stop()
+
+    def _reap_reader(self):
+        """Let the stdout reader finish so no QThread outlives its parent."""
+        if self._reader is None:
+            return
+        if not self._reader.wait(3000):
+            self._reader.terminate()
+            self._reader.wait(1000)
+        self._reader = None
+
+    def _on_done(self, output: str, seed=None, stats=None):
+        self._running = False
+        self.state_changed.emit(False)
+        self.utex_done.emit(output, seed, stats)
+
+    def _on_failed(self, msg: str):
+        self._running = False
+        self.state_changed.emit(False)
+        self.utex_failed.emit(msg)
+
+    def _on_dead(self, code: int):
+        if self._running:
+            self._running = False
+            self.state_changed.emit(False)
+            self.utex_failed.emit(
+                f"UltraTex worker exited unexpectedly (code {code}).")
+        self.log_line.emit(f"UltraTex worker process exited (code {code}).",
+                           "warn")
+
+    def _on_reader_finished(self, code: int):
+        # Ignore a late signal from a worker that a newer run replaced.
+        if self._proc is None and self._reader is not None:
+            self._reader = None

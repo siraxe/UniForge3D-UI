@@ -9,7 +9,9 @@ from PySide6.QtCore import QObject, Signal
 from PySide6.QtWidgets import QFileDialog, QMessageBox
 
 from dialogs import stage2_rescale_enabled as _stage2_rescale_enabled
-from model_paths import missing_hi3d_assets, missing_lato2_assets
+from model_paths import (missing_hi3d_assets, missing_lato2_assets,
+                         missing_ultratex_assets)
+from app.state import VIEWS_FILENAME
 from paths import (
     MODEL_DIR,
     OUTPUT_DIR,
@@ -24,6 +26,21 @@ from paths import (
     _textured_output_path,
 )
 
+
+NL = chr(10)
+
+
+def _mesh_file_has_uvs(path) -> bool:
+    """True when the mesh file on disk carries texture coordinates."""
+    try:
+        import trimesh
+        scene = trimesh.load(str(path), force="scene", process=False)
+        for geom in scene.geometry.values():
+            if getattr(getattr(geom, "visual", None), "uv", None) is not None:
+                return True
+    except Exception:
+        pass
+    return False
 
 class Pipeline(QObject):
     """Runs the model pipeline and reacts to its finished jobs."""
@@ -103,6 +120,7 @@ class Pipeline(QObject):
         """Copy the images used by this run into out_dir/inputs."""
         inputs_dir = out_dir / "inputs"
         used = 0
+        views: dict[str, str] = {}
         try:
             for src in sources:
                 if not src.is_file():
@@ -115,14 +133,21 @@ class Pipeline(QObject):
                     n += 1
                 shutil.copy2(src, target)
                 used += 1
+                view = self.app.view_map.get(src)
+                if view:
+                    views[target.name] = view
                 cutout = self.app.cutout_map.get(src)
                 if cutout and cutout.is_file():
                     base = (target.stem[:-4] if target.stem.endswith("_src")
                             else target.stem)
                     shutil.copy2(cutout, inputs_dir / f"{base}_cutout.png")
             if used:
-                self.log.emit(f"Copied {used} input image(s) to {inputs_dir}.",
-                              "info")
+                note = ""
+                if views and self.app.save_views(inputs_dir, views):
+                    note = (f"; {len(views)} reference view(s) saved to "
+                            f"{VIEWS_FILENAME}")
+                self.log.emit(f"Copied {used} input image(s) to {inputs_dir}."
+                              f"{note}", "info")
         except OSError as ex:
             self.log.emit("Could not copy input images into the run folder: "
                           f"{ex}", "warn")
@@ -536,6 +561,168 @@ class Pipeline(QObject):
             f"{'full GPU residency' if self.left.hi3d_fullgpu.isChecked() else 'global memory mode'}, "
             "geometry only) ...", "info")
 
+    def run_ultratex(self, *, output_mode, render_size, bake_size, steps,
+                     seed, refine, second_rig):
+        """Texture the displayed mesh with UltraTex (FLUX.2 Klein 9B).
+
+        The in-app sampling worker lands in milestone M2/M3 (see
+        ULTRATEX_PLAN.md); for now this validates the inputs and reports
+        what will run.
+        """
+        if self.jobs.busy:
+            return
+        loaded = self.viewer.current_path
+        # A circle-marked (middle-click) Outliner entry donates its geometry
+        # for the normal renders; the displayed mesh stays the texturing
+        # target (its UVs are required and the outputs land next to it).
+        ghost = self.viewer.ghost_path
+        render_mesh = None
+        if ghost is not None and Path(ghost).is_file() and (
+                loaded is None or not _paths_equal(loaded, ghost)):
+            render_mesh = Path(ghost)
+        if loaded is None or not loaded.is_file():
+            QMessageBox.information(
+                self.window, "UniForge3D",
+                "Load or generate a model first; UltraTex textures the "
+                "displayed mesh.")
+            self.changed.emit()
+            return
+        pending = self.window.edits.pending
+        has_uvs = bool(pending and pending.get("uvs") is not None)
+        if not has_uvs and _mesh_file_has_uvs(loaded):
+            # saved earlier with TEXCOORD_0 (pending was cleared on Save)
+            has_uvs = True
+        if not has_uvs:
+            QMessageBox.information(
+                self.window, "UltraTex needs UVs",
+                "This mesh has no texture coordinates. Click Unwrap UVs "
+                "in the UV accordion, then Save (or Bake) so the mesh "
+                "carries TEXCOORD_0, and run UltraTex again.")
+            return
+        seed_text = ("random" if seed is None else str(seed))
+        pbr = output_mode == "albedo_pbr"
+        # One reference image: the selected REF when one is picked, else the
+        # Early stop run's first image (same policy as Hi3D). A cutout's
+        # alpha channel serves as the object mask inside the worker.
+        image = self._hi3d_condition_image()
+        if image is None:
+            file, _ = QFileDialog.getOpenFileName(
+                self.window, "Select the reference image for UltraTex",
+                str(OUTPUT_DIR if OUTPUT_DIR.is_dir() else ROOT),
+                "Images (*.png *.jpg *.jpeg *.webp *.bmp)")
+            if not file:
+                return
+            image = Path(file)
+        if not image.is_file():
+            QMessageBox.warning(
+                self.window, "UniForge3D",
+                f"Reference image not found:\n{image}")
+            return
+        missing = missing_ultratex_assets(MODEL_DIR)
+        if missing:
+            self.log.emit("UltraTex is not ready; missing: "
+                          + "; ".join(missing), "error")
+            shown = NL.join(missing[:8])
+            if len(missing) > 8:
+                shown += NL + f"... and {len(missing) - 8} more"
+            QMessageBox.warning(
+                self.window, "UltraTex is not ready",
+                "UltraTex needs the UltraTex model group (get_models.bat) "
+                "and the vendored ComfyUI core. " + NL + NL + "Missing:" + NL + shown)
+            return
+        # cutout alpha doubles as the object mask inside the engine
+        mask = None
+        cutout = getattr(self.app, "cutout_map", {}).get(image)
+        if cutout is not None and Path(cutout).is_file():
+            mask = Path(cutout)
+        # View tags from the input accordion: each tagged image conditions
+        # its own rig view (cutouts preferred -- their alpha doubles as the
+        # object mask); missing views fall back to the closest tag inside
+        # the engine. The REF/first image stays the front fallback when
+        # nothing is tagged.
+        view_refs: dict[str, Path] = {}
+        for src, view in self.app.reference_views:
+            if not src.is_file():
+                continue
+            img = Path(self.app.cutout_map.get(src, src))
+            if img.is_file():
+                view_refs.setdefault(view, img)
+        if self.jobs.worker.alive:
+            self.jobs.worker.stop()
+            self.log.emit("UniForge worker unloaded to free GPU memory for "
+                          "UltraTex.", "info")
+        self.jobs.begin("ultratex")
+        self.changed.emit()
+        self.jobs.ultratex.start(
+            loaded, image, mask=mask,
+            seed=(None if seed is None else int(seed)),
+            steps=int(steps), render_size=int(render_size),
+            bake_size=int(bake_size), use_pbr=pbr, use_refine=bool(refine),
+            use_second_rig=bool(second_rig), render_mesh=render_mesh,
+            reference_views=view_refs or None)
+        self.log.emit(
+            f"UltraTex: texturing {loaded.name} | reference {image.name}"
+            + (f" | views: {', '.join(sorted(view_refs))}"
+               if view_refs else "")
+            + f" | render {render_size}px, bake {bake_size}px, steps {steps}, "
+            f"seed {seed_text}, refine {'on' if refine else 'off'}, second "
+            f"rig {'on' if second_rig else 'off'}, PBR {'on' if pbr else 'off'}",
+            "info")
+
+    def run_bake_ws_normal(self, resolution):
+        """World-space normal atlas: the displayed (UV'd) mesh is the
+        low-poly bake target, the circle-marked Outliner mesh is the
+        high-poly source."""
+        if self.jobs.busy:
+            return
+        loaded = self.viewer.current_path
+        if loaded is None or not loaded.is_file():
+            QMessageBox.information(
+                self.window, "UniForge3D",
+                "Load or generate a model first; the displayed mesh is the "
+                "low-poly bake target.")
+            self.changed.emit()
+            return
+        donor = self.viewer.ghost_path
+        if donor is None or not Path(donor).is_file() or (
+                _paths_equal(donor, loaded)):
+            QMessageBox.information(
+                self.window, "Bake WS Normal",
+                "Middle-click a mesh in the Outliner first: the marked mesh "
+                "is the high-poly source, the displayed mesh is the target "
+                "the normals are baked onto.")
+            return
+        pending = self.window.edits.pending
+        has_uvs = bool(pending and pending.get("uvs") is not None)
+        if not has_uvs and _mesh_file_has_uvs(loaded):
+            # saved earlier with TEXCOORD_0 (pending was cleared on Save)
+            has_uvs = True
+        if not has_uvs:
+            QMessageBox.information(
+                self.window, "Bake WS Normal needs UVs",
+                "The displayed mesh has no texture coordinates. Click "
+                "Unwrap UVs in the UV accordion, then Save (or Bake) so the "
+                "mesh carries TEXCOORD_0, and try again.")
+            return
+        if self.jobs.worker.alive:
+            self.jobs.worker.stop()
+            self.log.emit("UniForge worker unloaded to free GPU memory for "
+                          "the WS normal bake.", "info")
+        self.jobs.begin("utexws")
+        self.changed.emit()
+        self.jobs.ultratex.bake_ws(loaded, Path(donor),
+                                   resolution=int(resolution))
+        self.log.emit(
+            f"Bake WS Normal: target {loaded.name} | source "
+            f"{Path(donor).name} | {resolution}px atlas", "info")
+
+    def on_ws_normal_done(self, data: dict):
+        out = data["output"]
+        res = data.get("stats", {}).get("resolution")
+        self.log.emit(f"Bake WS Normal saved: {out.name}"
+                      + (f" ({res}px)" if res else ""), "ok")
+        self.changed.emit()
+
     def run_lato2(self):
         """Regenerate the displayed mesh with LATO.2 (retopology)."""
         if self.jobs.busy:
@@ -630,6 +817,13 @@ class Pipeline(QObject):
         cellocut, hi3d, lato2, worker = (
             self.jobs.cellocut, self.jobs.hi3d, self.jobs.lato2,
             self.jobs.worker)
+        if self.jobs.ultratex.running:
+            self.jobs.ultratex.stop()
+            self.jobs.clear_pending()
+            self.log.emit("UltraTex stopped (worker killed); nothing was "
+                          "written.", "warn")
+            self.changed.emit()
+            return
         if cellocut.running:
             cellocut.stop()
             self.jobs.clear_pending()
@@ -849,4 +1043,44 @@ class Pipeline(QObject):
                           "error")
         self.models.track_output(repaired)
         self.jobs.convert(repaired)
+        self.changed.emit()
+
+    def on_ultratex_done(self, data: dict):
+        out = data["output"]
+        stats = data.get("stats") or {}
+        seed = data.get("seed")
+        self.log.emit(f"UltraTex finished -> {out.name}", "ok")
+        if seed is not None:
+            self.app.set_seed(seed)
+        for key, label in (("albedo", "albedo atlas"),
+                           ("metallic", "metallic atlas"),
+                           ("roughness", "roughness atlas"),
+                           ("confidence", "confidence map")):
+            path = stats.get(key)
+            if path:
+                self.log.emit(f"UltraTex {label}: {Path(path).name}", "info")
+        views_dir = stats.get("views_dir")
+        if views_dir:
+            self.log.emit(f"UltraTex view renders: {views_dir}", "info")
+        # show the textured mesh on the 4th material swatch; the first
+        # three presets keep their materials
+        if out.is_file() and self.viewer.add_textured(out):
+            # jump straight to the textured preset so the result is visible
+            # immediately, and highlight the textured GLB in the Outliner
+            # (models bookkeeping stays on the source mesh)
+            self.viewer.set_material_preset("textured")
+            self.viewer.set_display_path(out)
+            self.log.emit("Texture added; textured preset (4th swatch) "
+                          "is now active.", "ok")
+        elif out.is_file() and out.suffix.lower() == ".glb"                 and self.viewer.load(out, preserve_camera=True,
+                                     preserve_material=True):
+            self.log.emit(f"Loaded textured mesh: {out.name}", "ok")
+        else:
+            self.log.emit("Open the atlas files from the output folder.",
+                          "info")
+        self.models.track_output(out)
+        self.changed.emit()
+
+    def on_ultratex_failed(self, msg: str):
+        self.log.emit(f"UltraTex failed: {msg}", "error")
         self.changed.emit()

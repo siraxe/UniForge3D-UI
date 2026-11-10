@@ -29,13 +29,29 @@ class OutlinerPanel(QWidget):
         layout.setContentsMargins(8, 0, 6, 8)   # no top padding
         layout.setSpacing(6)
 
-        # Draw toggle row, above the "Outliner:" header: a small square
-        # checkable button pinned to the right edge.  OFF by default; the
-        # smooth brush's Shift-hold activation only works while it is on
-        # (see viewer_brush.BrushController.set_draw_enabled).
+        # Draw toggle row, above the "Outliner:" header: the "UV" button on
+        # the left edge and a small square checkable Draw button pinned to
+        # the right edge.  Draw is OFF by default; the smooth brush's
+        # Shift-hold activation only works while it is on (see
+        # viewer_brush.BrushController.set_draw_enabled).
         draw_row = QWidget()
         draw_layout = QHBoxLayout(draw_row)
         draw_layout.setContentsMargins(0, 0, 0, 0)
+        self.uv_button = QPushButton("UV")
+        self.uv_button.setFixedSize(28, 28)
+        self.uv_button.setCursor(Qt.PointingHandCursor)
+        self.uv_button.setToolTip(
+            "Smooth the displayed mesh's normals (Maya-style averaged "
+            "vertex normals, across UV seams too). On-demand because it "
+            "takes a moment on very large meshes.")
+        self.uv_button.setStyleSheet(
+            "QPushButton {"
+            " background: #2a2d31; color: #9aa0a6;"
+            " border: 1px solid #3a3e44; border-radius: 4px;"
+            " font-size: 9px; padding: 0; }"
+            "QPushButton:hover { background: #33373c; color: #e6e8eb; }")
+        self.uv_button.clicked.connect(self._on_uv_clicked)
+        draw_layout.addWidget(self.uv_button, 0, Qt.AlignTop)
         draw_layout.addStretch(1)
         self.draw_button = QPushButton("Draw")
         self.draw_button.setCheckable(True)
@@ -81,6 +97,18 @@ class OutlinerPanel(QWidget):
         layout.addWidget(scroll, 1)
 
         self._show_buttons: list[QPushButton] = []
+
+    def _on_uv_clicked(self):
+        """'UV' button: toggle the bottom-right UV-shell overlay (also
+        smooths the displayed mesh's normals when shown)."""
+        result = self.win.viewer.toggle_uv_overlay()
+        if result == "shown":
+            self.win.log("UV shell overlay shown (normals smoothed). "
+                         "Press again to hide.", "ok")
+        elif result == "hidden":
+            self.win.log("UV shell overlay hidden.", "info")
+        else:
+            self.win.log("Mesh has no UVs to draw.", "warn")
 
     def _on_draw_toggled(self, checked: bool):
         """Forward the Draw toggle to the brush controller's gate."""
@@ -203,10 +231,11 @@ class OutlinerPanel(QWidget):
                     "QPushButton { text-align: left; padding: 2px 6px;"
                     " font-size: 11px; }"
                     + ("QPushButton { color: #2f9e57; }" if shown else ""))
-            tip = (f"{entry.name}\nCurrently displayed." if shown
-                   else f"Show {entry.name} in the 3D view (camera kept).")
-            btn.setToolTip(tip + "\nMiddle-click to ghost-compare; "
-                           "right-click for more.")
+            # No tooltip on object entries (hover was noisy); keep the text
+            # handy in case we re-purpose the tooltip slot later:
+            #   f"{entry.name}\nCurrently displayed." if shown else
+            #   f"Show {entry.name} in the 3D view (camera kept).\n"
+            #   "Middle-click to ghost-compare; right-click for more."
             btn.clicked.connect(
                 lambda _=False, p=entry: self.win.models.show(p))
             btn.middleClicked.connect(

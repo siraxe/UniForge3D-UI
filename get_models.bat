@@ -2,7 +2,8 @@
 setlocal EnableExtensions
 cd /d "%~dp0"
 
-rem Download every model file needed by UniForge3D, Hi3D v1.0 and LATO.2 into:
+rem Download every model file needed by UniForge3D, Hi3D v1.0, LATO.2 and
+rem UltraTex into:
 rem   models\<owner>\<repo>\...
 rem
 rem Public sources only:
@@ -11,16 +12,21 @@ rem                 microsoft/TRELLIS-image-large,
 rem                 hi3d-official/Hi3Dv1.0 (Run Hi3D 1536),
 rem                 facebook/dinov2-large and
 rem                 openai/clip-vit-large-patch14 (Hi3D encoders),
-rem                 0x4c48/LATO.2 (Run LATO.2)
+rem                 0x4c48/LATO.2 (Run LATO.2),
+rem                 Comfy-Org/UltraTex (Run UltraTex texture generation)
 rem   ModelScope:   public mirrors of gated facebook/dinov3... and
 rem                 briaai/RMBG-2.0
 rem   Meta:         dl.fbaipublicfiles.com DINOv2-L/14-reg (LATO.2 encoder)
 rem
-rem Hi3D v1.0 adds about 10.7 GB; LATO.2 adds about 4.8 GB.
+rem Hi3D v1.0 adds about 10.7 GB; LATO.2 adds about 4.8 GB; UltraTex adds
+rem about 11.1 GB (FLUX.2 Klein 9B int8-convrot only; the 18.2 GB bf16
+rem diffusion model is NOT downloaded).
 rem Existing files are skipped on rerun.
 rem
 rem CelloCut (Run CelloCut watertight button) needs NO model download; it
 rem ships as compiled wheels in .whl\ installed by install.bat.
+rem UV unwrapping (Unwrap UVs button) needs NO model download either; it
+rem uses the xatlas pip module.
 rem
 rem No models\hf_cache is created: files are fetched directly.
 rem
@@ -29,13 +35,13 @@ rem   get_models.bat             ask which model sets to download, then
 rem                              download/resume, skipping existing files
 rem   get_models.bat --check     report missing files only (no prompt)
 rem   get_models.bat --verify    also re-hash existing files (no prompt)
-rem   get_models.bat --groups main|hi3d|lato2|all
+rem   get_models.bat --groups main|hi3d|lato2|ultratex|all
 rem                              select a model set without the prompt
 rem                              (combine with commas, e.g. main,lato2)
 rem
 rem Optional env:
 rem   UNIFORGE_NO_PAUSE=1
-rem   UNIFORGE_GROUPS=main|hi3d|lato2|all   skip the selection prompt
+rem   UNIFORGE_GROUPS=main|hi3d|lato2|ultratex|all   skip the selection prompt
 
 set "PY_CMD="
 if exist ".venv\Scripts\python.exe" set "PY_CMD=.venv\Scripts\python.exe"
@@ -68,6 +74,7 @@ if defined ARGS goto have_args
 set "SEL_MAIN= "
 set "SEL_HI3D= "
 set "SEL_LATO= "
+set "SEL_UTEX= "
 
 call :show_menu
 
@@ -81,8 +88,11 @@ call :show_menu
 choice /c YN /n /m "   Download LATO.2?     [Y/N] "
 if errorlevel 2 (set "SEL_LATO=0") else (set "SEL_LATO=1")
 call :show_menu
+choice /c YN /n /m "   Download UltraTex?   [Y/N] "
+if errorlevel 2 (set "SEL_UTEX=0") else (set "SEL_UTEX=1")
+call :show_menu
 echo.
-if "%SEL_MAIN%"=="0" if "%SEL_HI3D%"=="0" if "%SEL_LATO%"=="0" (
+if "%SEL_MAIN%"=="0" if "%SEL_HI3D%"=="0" if "%SEL_LATO%"=="0" if "%SEL_UTEX%"=="0" (
     echo   Nothing selected. Please pick at least one model set.
     echo.
     goto ask_main
@@ -94,6 +104,10 @@ if "%SEL_MAIN%"=="0" if "%SEL_HI3D%"=="1" if "%SEL_LATO%"=="1" set "ARGS=--group
 if "%SEL_MAIN%"=="1" if "%SEL_HI3D%"=="0" if "%SEL_LATO%"=="0" set "ARGS=--groups main"
 if "%SEL_MAIN%"=="0" if "%SEL_HI3D%"=="1" if "%SEL_LATO%"=="0" set "ARGS=--groups hi3d"
 if "%SEL_MAIN%"=="0" if "%SEL_HI3D%"=="0" if "%SEL_LATO%"=="1" set "ARGS=--groups lato2"
+if "%SEL_MAIN%"=="0" if "%SEL_HI3D%"=="0" if "%SEL_LATO%"=="0" set "ARGS="
+if "%SEL_UTEX%"=="1" (
+    if defined ARGS (set "ARGS=%ARGS%,ultratex") else set "ARGS=--groups ultratex"
+)
 goto have_args
 
 :show_menu
@@ -101,9 +115,11 @@ rem Clears the screen and redraws the list; call after each answer.
 set "CB_MAIN=[ ]"
 set "CB_HI3D=[ ]"
 set "CB_LATO=[ ]"
+set "CB_UTEX=[ ]"
 if "%SEL_MAIN%"=="1" set "CB_MAIN=[x]"
 if "%SEL_HI3D%"=="1" set "CB_HI3D=[x]"
 if "%SEL_LATO%"=="1" set "CB_LATO=[x]"
+if "%SEL_UTEX%"=="1" set "CB_UTEX=[x]"
 cls
 echo ============================================================
 echo   Which models do you want to download?
@@ -120,6 +136,12 @@ echo.
 echo   %CB_LATO% LATO.2
 echo         V-Flow/T-Flow mesh generation checkpoints + DINOv2-L/14-reg
 echo         encoder. Required for "Run LATO.2". Adds about 4.8 GB.
+echo.
+echo   %CB_UTEX% UltraTex
+echo         FLUX.2 Klein 9B int8 model + 2 VAEs + UltraTex albedo/
+echo         metallic-roughness LoRAs + empty-prompt embedding.
+echo         Required for "Run UltraTex". Adds about 11.1 GB
+echo         (the 18.2 GB bf16 model is NOT downloaded).
 echo.
 exit /b 0
 

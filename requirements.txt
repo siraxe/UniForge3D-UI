@@ -46,6 +46,27 @@ pillow==12.3.0
 plyfile==1.1.5
 psutil==7.2.2
 pyfqmr==0.5.0
+xatlas==0.0.11
+
+# --- UltraTex (tools/ultratex, PS6_UI/workers/ultratex_worker.py) ---
+# comfy core library, imported from the vendored submodules/ComfyUI clone.
+# comfy-kitchen provides the int8 conv-rotation CUDA kernels the
+# flux-2-klein-9b_int8_convrot checkpoint needs (requires torch cu130).
+comfy-kitchen==0.2.41
+comfy-aimdo==0.6.0
+torchsde==0.2.6
+av>=19.0.2
+
+# UltraTex attention backends -- REQUIRED. The engine sets
+# comfy.cli_args.args.use_sage_attention (same as the reference ComfyUI
+# install's --use-sage-attention); without a real attention kernel comfy
+# falls back to attention_basic, which spills 30+ GB into shared VRAM on
+# the 6-view 2048px rig. Wheels are Windows-only builds for the verified
+# environment (torch 2.13.0+cu130, Python 3.12); triton-windows is the
+# triton build sageattention 2.x kernels run on.
+triton-windows==3.7.1.post27
+sageattention @ https://github.com/woct0rdho/SageAttention/releases/download/v2.2.0-windows.post6/sageattention-2.2.0+cu130torch2.10.0andhigher.post6-cp310-abi3-win_amd64.whl
+flash-attn @ https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.9.52/flash_attn-2.8.3+cu130torch2.13-cp312-cp312-win_amd64.whl
 pyyaml==6.0.3
 regex==2026.5.9
 requests==2.34.2

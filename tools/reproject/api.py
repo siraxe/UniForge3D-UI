@@ -656,7 +656,8 @@ def reproject_meshes(target_path: Path, source_path: Path, *,
 
 def save_reprojected(source_path: Path, output_path: Path,
                      vertices: np.ndarray, faces: np.ndarray | None = None,
-                     *, log: LogFn | None = None) -> dict:
+                     *, uvs: np.ndarray | None = None,
+                     log: LogFn | None = None) -> dict:
     source_path = Path(source_path)
     output_path = Path(output_path)
 
@@ -688,6 +689,27 @@ def save_reprojected(source_path: Path, output_path: Path,
 
     say(f"Save: writing {output_path.name} ...", "info")
     output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    uv_written = False
+    if uvs is not None:
+        uv = np.asarray(uvs, dtype=np.float32)
+        if uv.ndim == 2 and uv.shape[1] == 2 and len(uv) == len(mesh.vertices):
+            try:
+                from PIL import Image
+                from trimesh.visual.texture import TextureVisuals
+
+                placeholder = Image.new("RGB", (4, 4), (255, 255, 255))
+                mesh.visual = TextureVisuals(uv=uv, image=placeholder)
+                uv_written = True
+                say(f"Save: attaching the UV atlas ({len(uv):,} TEXCOORD_0 "
+                    "coordinates, placeholder material).", "info")
+            except Exception as ex:  # noqa: BLE001 - keep saving without UVs
+                say(f"Save: could not attach the UVs ({ex}); saving "
+                    "without them.", "warn")
+        else:
+            say("Save: the UV count does not match the vertices; saving "
+                "without UVs.", "warn")
+
     mesh.export(str(output_path))
     seconds = time.perf_counter() - started
     stats = {
@@ -698,6 +720,7 @@ def save_reprojected(source_path: Path, output_path: Path,
         "seconds": round(seconds, 2),
         "source": str(source_path),
         "preserved_material": bool(same_topology),
+        "uv_written": bool(uv_written),
     }
     say(f"Save: wrote {output_path.name} "
         f"({stats['vertex_count']:,} vertices, {stats['face_count']:,} "

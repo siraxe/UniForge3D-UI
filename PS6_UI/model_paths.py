@@ -243,3 +243,53 @@ def missing_hi3d_assets(model_dir: Path | None = None) -> list[str]:
 def hf_cache_dir() -> Path:
     """Project-local cache used only if a missing file must be downloaded."""
     return ROOT / ".cache" / "hf_cache"
+
+
+ULTRATEX_DIR_NAME = "Comfy-Org/UltraTex"
+
+# The 6 revision-pinned files fetched by get_models.bat (ULTRATEX_GROUPS in
+# tools/download_models.py), relative to models/Comfy-Org/UltraTex/.
+ULTRATEX_REQUIRED_FILES = (
+    "diffusion_models/flux-2-klein-base-9b_int8_convrot.safetensors",
+    "vae/ultratex_flux2_vae_fp32.safetensors",
+    "vae/flux2-vae.safetensors",
+    "loras/ultratex_flux2_klein_9b_albedo_lora_bf16.safetensors",
+    "loras/ultratex_flux2_klein_9b_metallic_roughness_lora_bf16.safetensors",
+    "embeddings/flux-2-klein-9b_empty_prompt.safetensors",
+)
+
+
+def find_ultratex_dir(model_dir: Path | None = None) -> Path | None:
+    """Locate the UltraTex model directory downloaded by get_models.bat."""
+    candidates = []
+    if model_dir is not None:
+        candidates.append(Path(model_dir) / "Comfy-Org" / "UltraTex")
+    candidates.append(MODELS_ROOT / ULTRATEX_DIR_NAME)
+    for candidate in candidates:
+        if (candidate / ULTRATEX_REQUIRED_FILES[0]).is_file():
+            return candidate.resolve()
+    return None
+
+
+def missing_ultratex_assets(model_dir: Path | None = None) -> list[str]:
+    """Return missing UltraTex model paths (plus the vendored comfy core).
+
+    Called before Run UltraTex so an incomplete download is reported with
+    exact paths instead of failing after loading several GB of weights.
+    """
+    missing: list[str] = []
+    if not (SUBMODULES_DIR / "ComfyUI" / "comfy").is_dir():
+        missing.append(
+            "vendored ComfyUI core "
+            f"({SUBMODULES_DIR / 'ComfyUI'}; git clone, pinned to the "
+            "UltraTex commit)")
+    utex_dir = find_ultratex_dir(model_dir)
+    if utex_dir is None:
+        missing.append(
+            "UltraTex model directory "
+            f"({MODELS_ROOT / ULTRATEX_DIR_NAME})")
+    else:
+        for relative in ULTRATEX_REQUIRED_FILES:
+            if not (utex_dir / relative).is_file():
+                missing.append(str(utex_dir / relative))
+    return missing
