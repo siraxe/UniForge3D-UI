@@ -113,6 +113,7 @@ _SWATCH_LOOKS = {                       # how each ball itself looks
     "textured": ((0.55, 0.55, 0.55), 0.0, 0.60),   # + albedo texture
 }
 _SWATCH_ORDER = ("dark_specular", "bronze", "original", "textured")
+_SWATCH_FLIP_NAME = "flip"             # 5th swatch: inverted-normals preview
 _SWATCH_RADIUS = 0.19                  # world units, ball radius
 _SWATCH_SPACING = 0.60                 # world units, center-to-center
 
@@ -219,6 +220,11 @@ class ModelViewer(QVTKRenderWindowInteractor):
         self._uv_overlay_actor = None
         self._uv_overlay_on = False
         self._uv_overlay_segs = None
+
+        # inverted-normals preview (5th swatch): display-only flip, never
+        # baked; reset when the model changes
+        self._swatch_hit_name = None
+        self._flip_normals = False
 
         # gray transparent "ghost" overlay (middle-click in the Outliner
         # list): a reference mesh shown next to the loaded one purely for
@@ -499,6 +505,7 @@ class ModelViewer(QVTKRenderWindowInteractor):
         self._ren.RemoveAllViewProps()
         self._ren.AddViewProp(self._info)   # RemoveAllViewProps dropped it
         self._info.SetText(vtk.vtkCornerAnnotation.UpperLeft, "")
+        self._restore_flip_normals()        # preview flip never survives a swap
         self._current_path = None
         self._model_actors = []
         self._originals = []
@@ -842,6 +849,41 @@ class ModelViewer(QVTKRenderWindowInteractor):
         if self._uv_overlay_actor is not None:
             self._uv_overlay_actor.SetVisibility(False)
 
+    # -- inverted-normals preview (5th swatch) -----------------------------
+    def _toggle_flip_normals(self):
+        """Preview the model with inverted normals (see inside).
+
+        Pure display state: front faces are culled while active, so the
+        near shell drops away and the far interior walls are drawn
+        instead (shaded lit via VTK's own two-sided flip). No normals
+        array or mesh data is modified in any way - negating the normal
+        values themselves would just render black (they'd point away
+        from every light), so this is deliberately view-only and there
+        is nothing to bake. Model changes reset it.
+        """
+        self._flip_normals = not self._flip_normals
+        for actor in (*self._model_actors, *self._texture_actors):
+            prop = actor.GetProperty()
+            prop.FrontfaceCullingOn() if self._flip_normals \
+                else prop.FrontfaceCullingOff()
+            prop.BackfaceCullingOff()   # far interior must stay visible
+        if not self._flip_normals:
+            self._apply_backface_culling()   # View-menu setting back on
+        self.notice.emit(
+            "Flip preview ON - front faces hidden, seeing inside; click "
+            "the swatch again to restore." if self._flip_normals
+            else "Flip preview OFF - back to normal display.", "info")
+        self.render_now()
+
+    def _restore_flip_normals(self):
+        """Undo the inverted-normals preview (idempotent, no data)."""
+        if not self._flip_normals:
+            return
+        self._flip_normals = False
+        for actor in (*self._model_actors, *self._texture_actors):
+            actor.GetProperty().FrontfaceCullingOff()
+        self._apply_backface_culling()
+
     def _read_gltf_actors(self, path: Path) -> list:
         """Actors read from a GLB/glTF, detached from the importer.
 
@@ -1156,7 +1198,7 @@ class ModelViewer(QVTKRenderWindowInteractor):
         if size[0] <= 0 or size[1] <= 0:
             return                       # not laid out yet
         aspect = size[0] / max(1.0, float(size[1]))
-        half_span = _SWATCH_SPACING * 1.5 + _SWATCH_RADIUS
+        half_span = _SWATCH_SPACING * 2.0 + _SWATCH_RADIUS   # 5 swatches
         scale = max(_SWATCH_RADIUS * 1.45, half_span / aspect)
         cam = self._swatch_ren.GetActiveCamera()
         cam.SetParallelScale(scale)
@@ -1356,13 +1398,14 @@ class ModelViewer(QVTKRenderWindowInteractor):
         self._swatch_ren.AddLight(key)
         self._swatch_ren.AddLight(fill)
 
-        # one row of four, even spacing; radius sized so balls keep a clear
-        # gap between each other and the panel edges
+        # one row of five: the four material balls then the flip-normals
+        # icon; radius sized so balls keep a clear gap between each other
+        # and the panel edges
         self._swatch_actors = {}
         radius = _SWATCH_RADIUS
         spacing = _SWATCH_SPACING            # center-to-center distance
-        xs = [(i - 1.5) * spacing for i in range(4)]
-        centers = dict(zip(_SWATCH_ORDER, ((x, 0.0) for x in xs)))
+        xs = [(i - 2.0) * spacing for i in range(5)]
+        centers = dict(zip(_SWATCH_ORDER, ((x, 0.0) for x in xs[:4])))
         for name in _SWATCH_ORDER:
             color, metallic, roughness = _SWATCH_LOOKS[name]
             source = vtk.vtkSphereSource()
@@ -1385,6 +1428,12 @@ class ModelViewer(QVTKRenderWindowInteractor):
             self._swatch_ren.AddActor(actor)
             self._swatch_actors[name] = actor
 
+        # 5th slot: flip-normals preview icon (circle outline in the UV-
+        # square style, crescent ~1/3 filled, 45deg double-ended arrow)
+        self._flip_center = (xs[4], 0.0)
+        for icon_actor in self._make_flip_icon_actors(*self._flip_center):
+            self._swatch_ren.AddActor(icon_actor)
+
         cam = self._swatch_ren.GetActiveCamera()
         cam.ParallelProjectionOn()
         cam.SetFocalPoint(0.0, 0.0, 0.0)
@@ -1392,6 +1441,127 @@ class ModelViewer(QVTKRenderWindowInteractor):
         cam.SetViewUp(0.0, 1.0, 0.0)
         self._swatch_ren.ResetCamera()
         self._fit_swatches()
+
+    @staticmethod
+    def _make_flip_icon_actors(cx: float, cy: float) -> list:
+        """Flip-normals button icon, drawn flat in the swatch overlay.
+
+        Circle outline in the UV-square style (transparent, white lines),
+        a crescent filling ~1/3 of the disk like a moon curve, and a 45
+        degree double-ended arrow across the middle (the flip indicator).
+        """
+        r = _SWATCH_RADIUS
+        # The swatch camera's auto clipping range hugs the sphere row and
+        # its near plane lands just behind z=0, which would clip flat
+        # geometry drawn exactly there; sink the flat icon behind the ball
+        # centers so it stays inside the frustum (visually identical).
+        z0 = -0.5 * r
+
+        def circle_arc(center, radius, deg0, deg1, n):
+            t = np.radians(np.linspace(deg0, deg1, n))
+            return np.column_stack([center[0] + radius * np.cos(t),
+                                    center[1] + radius * np.sin(t)])
+
+        # circle outline (closed line loop)
+        ring = circle_arc((cx, cy), r, 0.0, 360.0, 64)
+
+        # crescent: right-side arc of the circle + a terminator arc bulging
+        # right through (0.45r, 0), so the fill covers ~1/3 of the disk
+        # (circular segment subtracted from the half disk)
+        arc_o = circle_arc((cx, cy), r, 90.0, -90.0, 25)       # top -> bottom
+        a = 0.45 * r                       # terminator's rightmost bulge
+        h = (a * a - r * r) / (2.0 * a)    # terminator circle center offset
+        rt = np.hypot(h, r)                # terminator circle radius
+        th_max = np.arccos(-h / rt)        # reaches the poles (0, +-r)
+        t = np.linspace(-th_max, th_max, 25)              # bottom -> top
+        arc_t = np.column_stack([cx + h + rt * np.cos(t),
+                                 cy + rt * np.sin(t)])
+        crescent = np.vstack([arc_o, arc_t])
+
+        # 45 deg double-ended arrow across the middle (flip-flop indicator);
+        # tips stop 0.20r short of the outline ring
+        d = 0.80 * r
+        p0 = np.array([cx - d, cy - d])
+        p1 = np.array([cx + d, cy + d])
+        u = (p1 - p0) / np.linalg.norm(p1 - p0)
+        th = np.radians(30.0)
+        rot = np.array([[np.cos(th), -np.sin(th)],
+                        [np.sin(th), np.cos(th)]])
+        head = 0.26 * r
+        arm1a = p1 - head * (rot @ u)          # tip p1 -> two arms back
+        arm1b = p1 - head * (rot.T @ u)
+        arm2a = p0 + head * (rot @ u)          # tip p0 -> two arms outward
+        arm2b = p0 + head * (rot.T @ u)
+
+        # moon fill: closed polygon (outer arc + terminator arc), flat and
+        # unlit so it reads as a flat tint inside the outline
+        fill_poly = vtk.vtkPolyData()
+        fp = vtk.vtkPoints()
+        fp.SetData(numpy_to_vtk(
+            np.column_stack([crescent, np.full(len(crescent), z0)]),
+            deep=True))
+        fill_poly.SetPoints(fp)
+        m = len(crescent)
+        fc = np.arange(m, dtype=np.int64)          # polygon: point ids only
+        fo = np.array([0, m], dtype=np.int64)
+        fcells = vtk.vtkCellArray()
+        fcells.SetData(numpy_to_vtkIdTypeArray(fo, deep=True),
+                       numpy_to_vtkIdTypeArray(fc.ravel(), deep=True))
+        fill_poly.SetPolys(fcells)
+        fill = vtk.vtkActor()
+        fm = vtk.vtkPolyDataMapper()
+        fm.SetInputData(fill_poly)
+        fill.SetMapper(fm)
+        fill.GetProperty().SetColor(1.0, 1.0, 1.0)
+        fill.GetProperty().LightingOff()
+        fill.GetProperty().SetOpacity(0.30)
+
+        def line_polydata(polylines, closed):
+            """One line cell per polyline; polylines whose *index* is in
+            the *closed* set wrap last->first."""
+            all_pts = []
+            cells_rows = []
+            base = 0                          # running point-id offset
+            for pi, pts in enumerate(polylines):
+                all_pts.append(pts)
+                m = len(pts)
+                idx = np.arange(m, dtype=np.int64) + base
+                base += m
+                pairs = (np.column_stack([idx, np.roll(idx, -1)])
+                         if pi in closed
+                         else np.column_stack([idx[:-1], idx[1:]]))
+                cells_rows.append(pairs)
+            poly = vtk.vtkPolyData()
+            vp = vtk.vtkPoints()
+            vp.SetData(numpy_to_vtk(np.vstack([
+                np.column_stack([p, np.full(len(p), z0)])
+                for p in all_pts]), deep=True))
+            poly.SetPoints(vp)
+            conn = np.vstack(cells_rows)
+            n = len(conn)
+            offsets = np.arange(0, 2 * n + 1, 2, dtype=np.int64)
+            cells = vtk.vtkCellArray()
+            cells.SetData(numpy_to_vtkIdTypeArray(offsets, deep=True),
+                          numpy_to_vtkIdTypeArray(conn.ravel(), deep=True))
+            poly.SetLines(cells)
+            return poly
+
+        lines = vtk.vtkActor()
+        lm = vtk.vtkPolyDataMapper()
+        lm.SetInputData(line_polydata(
+            [ring, np.vstack([p0, p1]),
+             np.vstack([p1, arm1a]), np.vstack([p1, arm1b]),
+             np.vstack([p0, arm2a]), np.vstack([p0, arm2b])],
+            closed={0}))
+        lines.SetMapper(lm)
+        lines.GetProperty().SetColor(1.0, 1.0, 1.0)
+        lines.GetProperty().LightingOff()
+        lines.GetProperty().SetLineWidth(1.5)
+        lines.GetProperty().SetOpacity(0.95)
+        fill._swatch_preset = _SWATCH_FLIP_NAME
+        lines._swatch_preset = _SWATCH_FLIP_NAME
+        return [fill, lines]
+
     def _update_swatch_texture(self):
         """Snapshot the primary model and refresh the 'textured' ball."""
         if not self._originals:
@@ -1421,7 +1591,12 @@ class ModelViewer(QVTKRenderWindowInteractor):
                 prop.RemoveTexture("albedoTex")
             prop.SetColor(0.55, 0.55, 0.55)
     def _swatch_at(self, qt_x: int, qt_y: int) -> str | None:
-        """Preset name of the swatch ball under the cursor, if any."""
+        """Preset name of the swatch under the cursor, if any.
+
+        The resolved name is also stored on ``self._swatch_hit_name`` (the
+        hardware picker's view-prop goes stale between picks, so callers
+        must not re-read it).
+        """
         # Qt logical pixels -> VTK window display pixels (they can differ
         # with DPI scaling or before the window catches up to a resize).
         rw_w, rw_h = self.GetRenderWindow().GetSize()
@@ -1429,9 +1604,26 @@ class ModelViewer(QVTKRenderWindowInteractor):
         sy = rw_h / max(1, self.height())
         x_vtk = int(qt_x * sx)
         y_vtk = int(rw_h - qt_y * sy)   # VTK display origin is bottom-left
+        name = None
         if self._picker.Pick(x_vtk, y_vtk, 0.0, self._swatch_ren):
-            return getattr(self._picker.GetViewProp(), "_swatch_preset", None)
-        return None
+            name = getattr(self._picker.GetViewProp(), "_swatch_preset",
+                           None)
+        if name is None:
+            # the flip icon is flat line art the hardware picker misses;
+            # hit-test it geometrically against its circle
+            cam = self._swatch_ren.GetActiveCamera()
+            ren_w, ren_h = self._swatch_ren.GetSize()
+            if ren_w > 0 and ren_h > 0:
+                wpp = 2.0 * cam.GetParallelScale() / ren_h
+                coord = vtk.vtkCoordinate()
+                coord.SetCoordinateSystemToWorld()
+                coord.SetValue(*self._flip_center, 0.0)
+                dx, dy = coord.GetComputedDisplayValue(self._swatch_ren)
+                r_px = _SWATCH_RADIUS / wpp
+                if (x_vtk - dx) ** 2 + (y_vtk - dy) ** 2 <= r_px ** 2:
+                    name = _SWATCH_FLIP_NAME
+        self._swatch_hit_name = name
+        return name
     def _world_per_pixel(self) -> float:
         cam = self._ren.GetActiveCamera()
         h = max(1, self.height())
@@ -2328,10 +2520,11 @@ class ModelViewer(QVTKRenderWindowInteractor):
             elif self.brush.press_begin_stroke(x, y):
                 pass                       # smoothing stroke owns this drag
             elif self._swatch_at(x, y):
-                name = getattr(self._picker.GetViewProp(), "_swatch_preset",
-                               None)
-                if name and not (name == "textured"
-                                 and not self._has_textures):
+                name = self._swatch_hit_name
+                if name == _SWATCH_FLIP_NAME:
+                    self._toggle_flip_normals()
+                elif name and not (name == "textured"
+                                   and not self._has_textures):
                     self._set_preset(name)
                 self._mode = "swatch"
             elif self.brush.shift_active:

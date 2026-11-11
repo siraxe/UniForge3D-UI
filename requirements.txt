@@ -15,6 +15,7 @@
 #   torch_scatter==2.1.2   (LATO.2; built for CUDA 13 + sm_120)
 #   torchcumesh2sdf==0.0.1 (CelloCut; built for CUDA 13 + sm_120, C++20)
 #   cppmodules==0.0.1      (CelloCut; bundles the GMP/MPFR runtime DLLs)
+#   diso==0.1.4            (CelloCut; differentiable iso-surface extraction)
 # flash_attn==2.8.3+cu130torch2.13 is installed from Hugging Face.
 
 # --- torch stack ---
@@ -102,8 +103,7 @@ vtk==9.7.0
 
 # --- CelloCut watertight remeshing (PS6_UI/cello_worker.py) ---
 # Constructive method: no model download, GPU used for the 512^3 UDF.
-# torchcumesh2sdf / cppmodules come from the local .whl builds (see top).
-diso==0.1.4
+# torchcumesh2sdf / cppmodules / diso come from the local .whl builds (see top).
 pymaxflow==1.3.2
 
 # Optional attention fallback (default is flash_attn; not needed):

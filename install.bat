@@ -47,6 +47,7 @@ for %%W in (
     torch_scatter-2.1.2-cp312-cp312-win_amd64.whl
     torchcumesh2sdf-0.0.1-cp312-cp312-win_amd64.whl
     cppmodules-0.0.1-cp312-cp312-win_amd64.whl
+    diso-0.1.4-cp312-cp312-win_amd64.whl
 ) do (
     if not exist "!WHEEL_DIR!\%%W" (
         echo [install] Missing wheel: !WHEEL_DIR!\%%W
@@ -105,7 +106,7 @@ if errorlevel 1 goto :fail
 echo [install] Installing local compiled wheels from !WHEEL_DIR! ...
 rem cumm/spconv are custom CUDA 13 + sm_120 builds (no PyPI wheel exists for
 rem Blackwell on Windows). Install cumm first; spconv links against it.
-"!PY!" -m pip install --disable-pip-version-check --no-index --no-deps --find-links "!WHEEL_DIR!" "cumm-cu130==0.8.2" "spconv-cu130==2.3.8" "torch_scatter==2.1.2" "cumesh==0.0.1" "flex_gemm==1.0.0" "o_voxel==0.0.1" "nvdiffrast==0.4.0" "torchcumesh2sdf==0.0.1" "cppmodules==0.0.1"
+"!PY!" -m pip install --disable-pip-version-check --no-index --no-deps --find-links "!WHEEL_DIR!" "cumm-cu130==0.8.2" "spconv-cu130==2.3.8" "torch_scatter==2.1.2" "cumesh==0.0.1" "flex_gemm==1.0.0" "o_voxel==0.0.1" "nvdiffrast==0.4.0" "torchcumesh2sdf==0.0.1" "cppmodules==0.0.1" "diso==0.1.4"
 if errorlevel 1 goto :fail
 
 set "FLASH_ATTN_URL=https://huggingface.co/siraxe/wheels/resolve/main/flash_attn-2.8.3%%2Bcu130torch2.13-cp312-cp312-win_amd64.whl"
