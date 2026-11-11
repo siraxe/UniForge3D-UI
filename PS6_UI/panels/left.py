@@ -326,7 +326,8 @@ class LeftPanel(QWidget):
             item.setSizeHint(QSize(THUMB_SIZE, THUMB_SIZE))
             self.cutout_list.addItem(item)
             self.cutout_list.setItemWidget(
-                item, _Thumb(path, removable=False, border="#7bd88f"))
+                item, _Thumb(path, removable=False, border="#7bd88f",
+                             preview=True))
 
     def _remove_image(self, path: Path):
         state = self.win.app_state

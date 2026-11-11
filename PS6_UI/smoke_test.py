@@ -1,6 +1,6 @@
 """Headless smoke test - no Qt window or GL context needed.
 
-Verifies that a generated prediction.glb can be brought into VTK through the
+Verifies that a generated obj.glb can be brought into VTK through the
 same path ModelViewer.load() uses (direct import, or trimesh re-export
 fallback for GLBs that require extensions VTK does not know, e.g.
 EXT_texture_webp on outputs made before extension_webp=False).
@@ -15,8 +15,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import vtk
 
-glbs = sorted((ROOT / "output_dir").glob("*/prediction.glb"))
-assert glbs, "no prediction.glb found - generate something first"
+glbs = sorted((ROOT / "output_dir").glob("*/obj.glb"))
+assert glbs, "no obj.glb found - generate something first"
 glb = glbs[0]
 print("testing:", glb)
 

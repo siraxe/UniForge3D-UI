@@ -80,8 +80,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
-    QDialog, QFileDialog, QHBoxLayout, QLabel, QMainWindow, QMessageBox,
-    QPushButton, QSplitter, QVBoxLayout, QWidget,
+    QDialog, QFileDialog, QHBoxLayout, QLabel, QLineEdit, QMainWindow,
+    QMessageBox, QPushButton, QSplitter, QVBoxLayout, QWidget,
 )
 
 import viewer as viewer_mod
@@ -211,6 +211,13 @@ class MainWindow(QMainWindow):
             self.models.track_output(output)
 
     def _on_models_changed(self):
+        folder = self.models.folder
+        # Name field mirrors the project name saved for this folder; empty
+        # for unnamed folders and cleared entirely when no project is open.
+        self.edit_project_name.setText(self._project_name(folder))
+        has_folder = bool(folder and folder.is_dir())
+        self.edit_project_name.setEnabled(has_folder)
+        self.btn_rename.setEnabled(has_folder)
         self.outliner.refresh()
         self._refresh_buttons()
 
@@ -229,6 +236,9 @@ class MainWindow(QMainWindow):
         act_open.setShortcut(hotkeys.seq("open_folder"))
         act_open.triggered.connect(self.on_open_folder)
         m.addAction(act_open)
+        # Open Recent: submenu rebuilt from QSettings every time it shows.
+        self.menu_recent = m.addMenu("Open &Recent")
+        self.menu_recent.aboutToShow.connect(self._rebuild_recent_menu)
         m.addSeparator()
         act_quit = QAction("E&xit", self)
         act_quit.setShortcut(hotkeys.seq("exit"))
@@ -300,6 +310,21 @@ class MainWindow(QMainWindow):
         bar.addSpacing(12)               # left offset before "Open folder"
         bar.addWidget(b_open)
         bar.addWidget(self.btn_folder)
+        # Project name: prefixes the project folder name on disk
+        # (<name>_<folder>); empty until the user types one and hits Rename.
+        self.edit_project_name = QLineEdit()
+        self.edit_project_name.setToolTip("Project name")
+        self.edit_project_name.setFixedWidth(140)
+        self.edit_project_name.setEnabled(False)
+        self.edit_project_name.returnPressed.connect(self.on_rename_project)
+        self.btn_rename = QPushButton("Rename")
+        self.btn_rename.setToolTip(
+            "Prefix the project folder with the name above "
+            "(<name>_<folder>) and reopen it")
+        self.btn_rename.setEnabled(False)
+        self.btn_rename.clicked.connect(self.on_rename_project)
+        bar.addWidget(self.edit_project_name)
+        bar.addWidget(self.btn_rename)
         bar.addStretch(1)
         # The per-model buttons live in the Outliner column attached to the
         # left controls. Reset view and Backface culling are in the View menu.
@@ -432,10 +457,134 @@ class MainWindow(QMainWindow):
         if not chosen:
             return
         self.pipeline.open_folder(Path(chosen))
+        self._push_recent_folder(Path(chosen))
+
+    # -- Open Recent -------------------------------------------------------
+
+    #: Recent project folders remembered under File > Open Recent.
+    RECENT_MAX = 6
+
+    def _recent_folders(self):
+        """Persisted recent folders, most-recent first; dead ones dropped."""
+        raw = _app_settings().value("recent/folders", []) or []
+        if isinstance(raw, str):        # QSettings collapses 1-item lists
+            raw = [raw]
+        out = []
+        for p in raw:
+            folder = Path(p)
+            if folder.is_dir() and folder not in out:
+                out.append(folder)
+        return out[:self.RECENT_MAX]
+
+    def _push_recent_folder(self, folder: Path):
+        """Remember a folder as most-recent (dedup, cap at RECENT_MAX)."""
+        folder = Path(folder)
+        recents = [f for f in self._recent_folders() if f != folder]
+        recents.insert(0, folder)
+        _app_settings().setValue(
+            "recent/folders", [str(f) for f in recents[:self.RECENT_MAX]])
+
+    def _rebuild_recent_menu(self):
+        """Populate the Open Recent submenu just before it opens."""
+        self.menu_recent.clear()
+        recents = self._recent_folders()
+        if not recents:
+            act = self.menu_recent.addAction("(no recent folders)")
+            act.setEnabled(False)
+            return
+        for folder in recents:
+            act = self.menu_recent.addAction(folder.name)
+            act.setToolTip(str(folder))
+            act.triggered.connect(
+                lambda checked=False, f=folder: self._open_recent_folder(f))
+
+    def _open_recent_folder(self, folder: Path):
+        """File > Open Recent: reopen a previously opened project folder."""
+        self.pipeline.open_folder(folder)
+        self._push_recent_folder(folder)
 
     def on_open_output_folder(self):
         """Open the folder holding the last generated model (glb/obj/...)."""
         self.models.open_output_folder()
+
+    # -- project name / folder rename --------------------------------------
+
+    def _name_key(self, folder: Path) -> str:
+        """QSettings key storing the project name given to a folder."""
+        return f"recent/name/{folder.as_posix().replace('/', chr(92))}"
+
+    def _project_name(self, folder: Path | None) -> str:
+        """The project name the user assigned to a folder ('' if none)."""
+        if folder is None:
+            return ""
+        return _app_settings().value(self._name_key(folder), "") or ""
+
+    def _base_dirname(self, folder: Path) -> str:
+        """Folder name with a previously assigned project prefix removed,
+        so re-renaming replaces the prefix instead of stacking them."""
+        name = folder.name
+        old = self._project_name(folder)
+        if old and name.startswith(old + "_"):
+            return name[len(old) + 1:]
+        return name
+
+    def on_rename_project(self):
+        """Prefix the current project folder's name with the project name.
+
+        Renames the folder on disk to <name>_<old folder name>, updates the
+        Open Recent entry and reopens the renamed folder."""
+        folder = self.models.folder
+        if folder is None or not folder.is_dir():
+            return
+        if self.jobs.busy:
+            QMessageBox.information(
+                self, "Rename project",
+                "Wait for the current background job to finish first.")
+            return
+        name = self.edit_project_name.text().strip()
+        if not name:
+            QMessageBox.information(
+                self, "Rename project", "Enter a project name first.")
+            return
+        for ch in '<>:"/\\|?*':            # keep the name filesystem-safe
+            name = name.replace(ch, "_")
+        new_path = folder.with_name(f"{name}_{self._base_dirname(folder)}")
+        if new_path.exists():
+            QMessageBox.warning(
+                self, "Rename project",
+                f"A folder named {new_path.name} already exists.")
+            return
+        try:
+            new_path = folder.rename(new_path)
+        except OSError as exc:
+            QMessageBox.warning(
+                self, "Rename project",
+                f"Could not rename the folder:\n{exc}")
+            return
+        settings = _app_settings()
+        settings.remove(self._name_key(folder))
+        settings.setValue(self._name_key(new_path), name)
+        self._retarget_recent(folder, new_path)
+        self.log(f"Project renamed to {new_path.name}.", "info")
+        # Reload everything from the new location; _on_models_changed picks
+        # up the new folder and refreshes the name field from settings.
+        self.pipeline.open_folder(new_path)
+
+    def _retarget_recent(self, old: Path, new: Path):
+        """Point an Open Recent entry at the renamed folder, keeping order.
+
+        Uses the raw stored list: the old path is already gone from disk, so
+        the existence-filtered view would silently drop the entry."""
+        raw = _app_settings().value("recent/folders", []) or []
+        if isinstance(raw, str):        # QSettings collapses 1-item lists
+            raw = [raw]
+        out = []
+        for p in raw:
+            q = new if Path(p) == old else Path(p)
+            if q not in out:
+                out.append(q)
+        _app_settings().setValue(
+            "recent/folders", [str(f) for f in out[:self.RECENT_MAX]])
 
     def on_toggle_projection(self):
         """Swap the 3D camera between perspective and orthographic."""

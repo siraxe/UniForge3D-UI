@@ -77,11 +77,14 @@ class _Thumb(QWidget):
 
     def __init__(self, path: Path, size: int = THUMB_SIZE,
                  border: str | None = None, removable: bool = True,
-                 selectable: bool = False, parent=None):
+                 selectable: bool = False, preview: bool = False,
+                 parent=None):
         super().__init__(parent)
         self.path = path
         self.setFixedSize(size, size)
         self._selectable = selectable
+        # Hover preview without click-to-select (e.g. the cutout tiles).
+        self._preview_enabled = selectable or preview
         self._border = border
         self._selected = False
         self._preview: _ImagePreview | None = None
@@ -194,7 +197,7 @@ class _Thumb(QWidget):
 
     # -- hover preview (any hovered selectable thumbnail) ------------------
     def _show_preview(self):
-        if not (self._selectable and self.isVisible()):
+        if not (self._preview_enabled and self.isVisible()):
             return
         if self._preview is None:
             self._preview = _ImagePreview(self.path, self)
@@ -206,7 +209,7 @@ class _Thumb(QWidget):
 
     def enterEvent(self, event):
         super().enterEvent(event)
-        if self._selectable:
+        if self._preview_enabled:
             self._hover_timer.start()
 
     def leaveEvent(self, event):

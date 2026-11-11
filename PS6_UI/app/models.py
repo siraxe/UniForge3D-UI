@@ -17,7 +17,6 @@ from paths import (
     _folder_models,
     _model_sidecars,
     _paths_equal,
-    _shape512_state_path,
     _shape_state_path,
     _validate_model_stem,
 )
@@ -119,8 +118,12 @@ class ModelLibrary(QObject):
             self.changed.emit()
             return
         names = {model.name for model in models}
+        # Prefer the short "obj*" names new runs produce; fall back to the
+        # legacy "prediction*" names so old projects still auto-load.
         first = next((n for n in (
+            "obj.glb", "obj_512.glb",
             "prediction.glb", "prediction_512.glb",
+            "obj.obj", "obj_512.obj",
             "prediction.obj", "prediction_512.obj") if n in names),
             models[0].name)
         target = folder / first
@@ -219,7 +222,10 @@ class ModelLibrary(QObject):
             self.log.emit(f"Could not open Explorer: {ex}", "error")
 
     def duplicate(self, path: Path):
-        """Duplicate one model file as <stem>_copy (without its sidecars)."""
+        """Duplicate one model file as <stem>Dupl (without its sidecars).
+
+        No underscore, so the copy does not nest under the original in the
+        Outliner hierarchy."""
         path = Path(path)
         if self.jobs.busy:
             QMessageBox.information(
@@ -230,11 +236,11 @@ class ModelLibrary(QObject):
             self.log.emit(f"Duplicate: {path.name} no longer exists.", "warn")
             self.changed.emit()
             return
-        copy_path = path.with_name(path.stem + "_copy" + path.suffix)
+        copy_path = path.with_name(path.stem + "Dupl" + path.suffix)
         n = 2
         while copy_path.exists():
             copy_path = path.with_name(
-                f"{path.stem}_copy_{n}{path.suffix}")
+                f"{path.stem}Dupl{n}{path.suffix}")
             n += 1
         try:
             shutil.copy2(path, copy_path)
@@ -245,8 +251,36 @@ class ModelLibrary(QObject):
         self.log.emit(f"Duplicated {path.name} -> {copy_path.name}.", "ok")
         self.changed.emit()
 
+    #: Extra sidecars that hang off a model stem besides the .shape_state.pt
+    #: / .shape512.pt pair (scene checkpoint, world-space normal atlas).
+    _EXTRA_SIDECAR_TAILS = ("_scene.shape512.pt", "_wsnormal.png")
+
+    #: Texture image extensions the published OBJ copy may carry (the
+    #: exporter names the material/texture after the model stem).
+    _TEXTURE_SUFFIXES = (".png", ".jpg", ".jpeg")
+
+    def _sidecars_of(self, model: Path) -> list[Path]:
+        """All existing files derived from a model's stem.
+
+        Covers the state checkpoints, the scene checkpoint, the WS-normal
+        atlas, and the published OBJ copy set (<stem>.obj plus its
+        <stem>.mtl and <stem>.<png/jpg> texture)."""
+        candidates = [*_model_sidecars(model)] + [
+            model.with_name(model.stem + tail)
+            for tail in self._EXTRA_SIDECAR_TAILS]
+        # Published OBJ companion and its material/texture files.
+        if model.suffix.lower() != ".obj":      # an OBJ is not its own twin
+            obj_twin = model.with_suffix(".obj")
+            candidates.append(obj_twin)
+            candidates.append(model.with_name(model.stem + ".mtl"))
+            candidates.extend(
+                model.with_name(model.stem + ext)
+                for ext in self._TEXTURE_SUFFIXES)
+        return [c for c in candidates if c.is_file()]
+
     def rename(self, path: Path):
-        """Rename one model file and its state sidecars from the Outliner."""
+        """Rename a model file, its state sidecars and every derived object
+        below it, so the Outliner hierarchy survives the rename."""
         path = Path(path)
         if self.jobs.busy:
             QMessageBox.information(
@@ -259,7 +293,8 @@ class ModelLibrary(QObject):
             return
         parent = self.parent()
         new_stem, accepted = QInputDialog.getText(
-            parent, "Rename object", f"New name for {path.name}:",
+            parent, "Rename object",
+            f"New name for {path.name} (objects below it are renamed too):",
             QLineEdit.Normal, path.stem)
         if not accepted:
             return
@@ -283,18 +318,35 @@ class ModelLibrary(QObject):
                 f"{new_path.name} already exists in this folder.")
             return
 
-        old_sidecars = _model_sidecars(path)
-        new_sidecars_by_kind = {
-            "state": _shape_state_path(new_path),
-            "shape512": _shape512_state_path(new_path),
-        }
-        moved: list[tuple[Path, Path]] = []
-        for old_sidecar in old_sidecars:
-            kind = ("state" if old_sidecar.name.endswith(".shape_state.pt")
-                    else "shape512")
-            moved.append((old_sidecar, new_sidecars_by_kind[kind]))
-        for _, new in moved:
-            if new.exists() and not case_only:
+        # Plan: the file itself, then everything nested under it.  A child
+        # keeps everything after the "<stem>_" prefix (obj_512_hi3d_1536
+        # follows obj_512 all the way down, like the Outliner nesting).
+        # Each branch is (old model, new model, [(old sidecar, new), ...]);
+        # sidecar ownership is fixed here, not guessed from name prefixes.
+        branches: list[tuple[Path, Path, list[tuple[Path, Path]]]] = [
+            (path, new_path, [])]
+        if not case_only:
+            prefix_len = len(path.stem)
+            low_prefix = path.stem.lower() + "_"
+            for entry in _folder_models(path.parent):
+                if entry == path:
+                    continue
+                if not entry.stem.lower().startswith(low_prefix):
+                    continue
+                branches.append((entry, entry.with_name(
+                    new_stem + entry.stem[prefix_len:] + entry.suffix), []))
+
+        # Sidecars follow their model's stem (<old stem><tail> -> <new>).
+        for old_model, new_model, sidecars in branches:
+            for old_sidecar in self._sidecars_of(old_model):
+                tail = old_sidecar.name[len(old_model.stem):]
+                sidecars.append(
+                    (old_sidecar, new_model.with_name(new_model.stem + tail)))
+
+        moves = [m for _, _, sidecars in branches for m in sidecars]
+        moves += [(old, new) for old, new, _ in branches]
+        for old, new in moves:
+            if new != old and new.exists():
                 QMessageBox.warning(
                     parent, "Rename object",
                     f"Cannot rename: {new.name} already exists.")
@@ -302,10 +354,11 @@ class ModelLibrary(QObject):
 
         renamed: list[tuple[Path, Path]] = []
         try:
-            for old, new in moved:
+            # Sidecars first, then models - names never overlap, but this
+            # keeps state files consistent if anything fails midway.
+            for old, new in moves:
                 old.rename(new)
                 renamed.append((old, new))
-            path.rename(new_path)
         except OSError as ex:
             for old, new in reversed(renamed):
                 try:
@@ -316,12 +369,18 @@ class ModelLibrary(QObject):
             QMessageBox.warning(parent, "Rename failed", str(ex))
             return
 
-        self._remap(path, new_path, moved)
-        sidecar_note = (f" (and {len(moved)} state file"
-                        f"{'s' if len(moved) != 1 else ''})"
-                        if moved else "")
-        self.log.emit(f"Renamed {path.name} -> {new_path.name}{sidecar_note}.",
-                      "ok")
+        for old_model, new_model, sidecars in branches:
+            self._remap(old_model, new_model, sidecars)
+
+        extra = len(branches) - 1
+        sidecar_count = sum(len(s) for _, _, s in branches)
+        sidecar_note = (f" (and {sidecar_count} state file"
+                        f"{'s' if sidecar_count != 1 else ''})"
+                        if sidecar_count else "")
+        derived_note = (f" (+{extra} below)" if extra else "")
+        self.log.emit(
+            f"Renamed {path.name} -> {new_path.name}{derived_note}"
+            f"{sidecar_note}.", "ok")
         self.changed.emit()
 
     def _remap(self, old: Path, new: Path, moved_sidecars):

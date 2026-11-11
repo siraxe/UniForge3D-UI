@@ -126,6 +126,7 @@ class OutlinerPanel(QWidget):
 
     def _show_object_menu(self, path, global_pos):
         menu = QMenu(self)
+        act_duplicate = menu.addAction("Duplicate")
         act_rename = menu.addAction("Rename...")
         act_show_obj = menu.addAction("Show obj")
         obj_path = self.win.models.obj_path(path)
@@ -133,7 +134,6 @@ class OutlinerPanel(QWidget):
         act_show_obj.setToolTip(
             f"Select {obj_path.name} in Explorer." if obj_path is not None
             else "No matching .obj file beside this model.")
-        act_duplicate = menu.addAction("Duplicate")
         act_delete = menu.addAction("Delete")
         menu.setToolTipsVisible(True)
         chosen = menu.exec(global_pos)
@@ -149,9 +149,8 @@ class OutlinerPanel(QWidget):
     def refresh(self):
         folder = self.win.models.folder
         # GLBs plus OBJs that have no GLB twin, so import-only assets show up.
-        # Natural order: prediction_512 before prediction_1024 before
-        # prediction_hi3d_1536 etc. sorted() already does the right thing for
-        # our naming scheme.
+        # Natural order: obj_512 before obj_1024 before obj_hi3d_1536 etc.
+        # sorted() already does the right thing for our naming scheme.
         entries = (_folder_models(folder)
                    if folder and folder.is_dir() else [])
         current = self.win.viewer.current_path

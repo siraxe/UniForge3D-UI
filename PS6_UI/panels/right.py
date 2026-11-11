@@ -433,7 +433,12 @@ class RightPanel(QWidget):
         ):
             self.utex_output.addItem(label, mode)
         self.utex_output.setCurrentIndex(0)
-        self.utex_output.setMinimumWidth(160)
+        # Don't size to the widest item ("Albedo + PBR ...") - elide instead,
+        # otherwise the combo (and the whole panel) blows up in width.
+        self.utex_output.setSizeAdjustPolicy(
+            QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self.utex_output.setMinimumContentsLength(10)
+        self.utex_output.setMinimumWidth(100)
         self.utex_output.setToolTip(
             "Generated texture set: albedo always; PBR adds the "
             "metallic/roughness LoRA pass")
@@ -442,7 +447,10 @@ class RightPanel(QWidget):
         for res in (512, 1024, 1536, 2048):
             self.utex_render.addItem(f"{res}", res)
         self.utex_render.setCurrentIndex(1)        # 1024
-        self.utex_render.setMinimumWidth(100)
+        self.utex_render.setSizeAdjustPolicy(
+            QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self.utex_render.setMinimumContentsLength(4)
+        self.utex_render.setMinimumWidth(64)
         self.utex_render.setToolTip(
             "Per-view render resolution (world-normal + texture views)")
 
@@ -450,7 +458,10 @@ class RightPanel(QWidget):
         for res in (2048, 4096, 8192):
             self.utex_bake.addItem(f"{res}", res)
         self.utex_bake.setCurrentIndex(1)          # 4096
-        self.utex_bake.setMinimumWidth(100)
+        self.utex_bake.setSizeAdjustPolicy(
+            QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self.utex_bake.setMinimumContentsLength(4)
+        self.utex_bake.setMinimumWidth(64)
         self.utex_bake.setToolTip(
             "Baked atlas resolution (Bake Texture From Views)")
 

@@ -88,11 +88,11 @@ class Pipeline(QObject):
         geometry_only = geometry_only or stop_at_stage1
         base_name = sources[0].stem + "_" + time.strftime("%Y%m%d_%H%M%S")
         out_dir = OUTPUT_DIR / base_name
-        output_name = ("prediction_512.glb" if stop_at_stage1
-                       else "prediction.glb")
+        output_name = ("obj_512.glb" if stop_at_stage1
+                       else "obj.glb")
         suffix = 2
         while any((out_dir / name).exists()
-                  for name in ("prediction.glb", "prediction_512.glb")):
+                  for name in ("obj.glb", "obj_512.glb")):
             out_dir = OUTPUT_DIR / f"{base_name}_{suffix}"
             suffix += 1
         output_path = out_dir / output_name
