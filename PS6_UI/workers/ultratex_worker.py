@@ -133,6 +133,7 @@ def main() -> int:
         job = UltraTexJob(
             mesh_path=cmd["mesh"],
             render_mesh_path=cmd.get("render_mesh"),
+            ws_normal_map=cmd.get("ws_normal_map"),
             reference_image=cmd["reference"],
             reference_mask=cmd.get("mask"),
             reference_views=reference_views or None,

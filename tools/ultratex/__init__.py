@@ -125,6 +125,12 @@ class UltraTexJob:
     render_mesh_path: str | None = None  # optional geometry donor for the
                                       # normal renders (circle-marked ghost
                                       # mesh); defaults to mesh_path
+    ws_normal_map: str | None = None  # prebaked world-space normal map
+                                      # (<mesh>_wsnormal.png); when set the
+                                      # conditioning renders show the baked
+                                      # high-poly normals on the displayed
+                                      # low-poly mesh (render_mesh_path is
+                                      # ignored in this mode)
     reference_mask: str | None = None # RMBG cutout; RemoveBackground fallback
     reference_views: dict | None = None  # {view name: image path} tagged in
                                       # the UI; missing views fall back to

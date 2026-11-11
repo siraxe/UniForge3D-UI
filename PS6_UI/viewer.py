@@ -404,6 +404,12 @@ class ModelViewer(QVTKRenderWindowInteractor):
             actor.SetVisibility(visible)
         self.render_now()
 
+    def remove_ghost(self):
+        """Drop the ghost overlay entirely (File > New project)."""
+        if self._ghost_path is not None:
+            self._remove_ghost()
+            self.render_now()
+
     def toggle_ghost(self, path) -> bool:
         """Middle-click action: overlay *path* as a gray transparent ghost.
 
@@ -1029,6 +1035,40 @@ class ModelViewer(QVTKRenderWindowInteractor):
         for actor in actors:
             self._ren.AddActor(actor)
     def _add_polydata(self, polydata):
+        # Readers (STL/PLY) and load_arrays deliver polydata without
+        # normals; VTK then lights flat per polygon, and the UV-seam
+        # duplicated topology of unwrapped meshes shades as cut shells
+        # ("made from chunks"). Welded smooth normals (Maya-style,
+        # averaged per unique position) fix both.
+        if polydata.GetPointData().GetNormals() is None \
+                and polydata.GetNumberOfPolys() > 0:
+            try:
+                from utils.mesh import welded_smooth_normals
+
+                pts = np.asarray(vtk_to_numpy(polydata.GetPoints().GetData()),
+                                 dtype=np.float64)
+                offsets = vtk_to_numpy(polydata.GetPolys().GetOffsetsArray())
+                conn = vtk_to_numpy(polydata.GetPolys().GetConnectivityArray())
+                sizes = np.diff(offsets)
+                if len(sizes) and sizes.min() == sizes.max() == 3:
+                    tris = conn.reshape(-1, 3).astype(np.int64)
+                else:
+                    fans = []
+                    for s, e in zip(offsets[:-1], offsets[1:]):
+                        fan = conn[s:e]
+                        if len(fan) < 3:
+                            continue
+                        fans.append(np.stack(
+                            [np.full(len(fan) - 2, fan[0]), fan[1:-1],
+                             fan[2:]], axis=1))
+                    tris = np.concatenate(fans, axis=0).astype(np.int64)
+                normals = welded_smooth_normals(pts, tris)
+                arr = numpy_to_vtk(np.ascontiguousarray(normals), deep=True)
+                arr.SetName("Normals")
+                polydata.GetPointData().SetNormals(arr)
+                polydata.Modified()
+            except Exception:
+                pass             # shading fallback only; never block a load
         mapper = vtk.vtkPolyDataMapper()
         mapper.SetInputData(polydata)
         actor = vtk.vtkActor()
@@ -1317,6 +1357,13 @@ class ModelViewer(QVTKRenderWindowInteractor):
             for entry in self._originals:
                 if restore:
                     self._restore_material(entry)
+                    if name == "original" and entry["textures"]:
+                        # the 3rd swatch shows the original *material* only;
+                        # textures stay exclusive to the 4th (textured) view
+                        prop = entry["actor"].GetProperty()
+                        for slot in entry["textures"]:
+                            if hasattr(prop, "RemoveTexture"):
+                                prop.RemoveTexture(slot)
                     continue
                 prop = entry["actor"].GetProperty()
                 color, metallic, roughness = _PRESETS[name]
@@ -1402,6 +1449,8 @@ class ModelViewer(QVTKRenderWindowInteractor):
         # icon; radius sized so balls keep a clear gap between each other
         # and the panel edges
         self._swatch_actors = {}
+        # subtle checkerboard icon look for the 'textured' ball (always on)
+        self._textured_swatch_fallback = self._make_textured_swatch_texture()
         radius = _SWATCH_RADIUS
         spacing = _SWATCH_SPACING            # center-to-center distance
         xs = [(i - 2.0) * spacing for i in range(5)]
@@ -1425,6 +1474,9 @@ class ModelViewer(QVTKRenderWindowInteractor):
             cx, cy = centers[name]
             actor.SetPosition(cx, cy, 0.0)
             actor._swatch_preset = name
+            if name == "textured":
+                prop.SetTexture("albedoTex", self._textured_swatch_fallback)
+                prop.SetColor(1.0, 1.0, 1.0)   # texture carries the color
             self._swatch_ren.AddActor(actor)
             self._swatch_actors[name] = actor
 
@@ -1478,20 +1530,17 @@ class ModelViewer(QVTKRenderWindowInteractor):
                                  cy + rt * np.sin(t)])
         crescent = np.vstack([arc_o, arc_t])
 
-        # 45 deg double-ended arrow across the middle (flip-flop indicator);
-        # tips stop 0.20r short of the outline ring
-        d = 0.80 * r
+        # 45 deg double-ended arrow across the middle (flip-flop indicator):
+        # a thick shaft plus two filled, sharp triangular heads; tips stay
+        # inside the outline ring with a generous offset (tip distance is
+        # d*sqrt2 from the center)
+        d = 0.52 * r
         p0 = np.array([cx - d, cy - d])
         p1 = np.array([cx + d, cy + d])
         u = (p1 - p0) / np.linalg.norm(p1 - p0)
-        th = np.radians(30.0)
-        rot = np.array([[np.cos(th), -np.sin(th)],
-                        [np.sin(th), np.cos(th)]])
-        head = 0.26 * r
-        arm1a = p1 - head * (rot @ u)          # tip p1 -> two arms back
-        arm1b = p1 - head * (rot.T @ u)
-        arm2a = p0 + head * (rot @ u)          # tip p0 -> two arms outward
-        arm2b = p0 + head * (rot.T @ u)
+        perp = np.array([-u[1], u[0]])
+        head = 0.36 * r                   # head length along the shaft
+        w = head * np.tan(np.radians(26.0))   # half base width -> sharp tip
 
         # moon fill: closed polygon (outer arc + terminator arc), flat and
         # unlit so it reads as a flat tint inside the outline
@@ -1546,21 +1595,87 @@ class ModelViewer(QVTKRenderWindowInteractor):
             poly.SetLines(cells)
             return poly
 
-        lines = vtk.vtkActor()
-        lm = vtk.vtkPolyDataMapper()
-        lm.SetInputData(line_polydata(
-            [ring, np.vstack([p0, p1]),
-             np.vstack([p1, arm1a]), np.vstack([p1, arm1b]),
-             np.vstack([p0, arm2a]), np.vstack([p0, arm2b])],
-            closed={0}))
-        lines.SetMapper(lm)
-        lines.GetProperty().SetColor(1.0, 1.0, 1.0)
-        lines.GetProperty().LightingOff()
-        lines.GetProperty().SetLineWidth(1.5)
-        lines.GetProperty().SetOpacity(0.95)
+        ring_actor = vtk.vtkActor()
+        rm = vtk.vtkPolyDataMapper()
+        rm.SetInputData(line_polydata([ring], closed={0}))
+        ring_actor.SetMapper(rm)
+        ring_actor.GetProperty().SetColor(1.0, 1.0, 1.0)
+        ring_actor.GetProperty().LightingOff()
+        ring_actor.GetProperty().SetLineWidth(1.0)
+        ring_actor.GetProperty().SetOpacity(0.95)
+
+        # shaft: single thick line between the two tips
+        shaft = vtk.vtkActor()
+        sm = vtk.vtkPolyDataMapper()
+        sm.SetInputData(line_polydata([np.vstack([p0, p1])], closed=set()))
+        shaft.SetMapper(sm)
+        shaft.GetProperty().SetColor(1.0, 1.0, 1.0)
+        shaft.GetProperty().LightingOff()
+        shaft.GetProperty().SetLineWidth(3.0)
+        shaft.GetProperty().SetOpacity(0.95)
+
+        # arrowheads: two filled triangles (one per tip), flat and unlit
+        head_pts, head_cells, base = [], [], 0
+        for tip, back in ((p1, p0), (p0, p1)):
+            v = (back - tip) / np.linalg.norm(back - tip)   # into the shaft
+            b = tip + head * v                              # base center
+            for corner in (tip, b + w * perp, b - w * perp):
+                head_pts.append(corner)
+            head_cells.append([base, base + 1, base + 2])
+            base += 3
+        heads_poly = vtk.vtkPolyData()
+        hp = vtk.vtkPoints()
+        hp.SetData(numpy_to_vtk(np.column_stack(
+            [np.array(head_pts), np.full(len(head_pts), z0)]), deep=True))
+        heads_poly.SetPoints(hp)
+        hc = np.array(head_cells, dtype=np.int64)
+        hcells = vtk.vtkCellArray()
+        hcells.SetData(numpy_to_vtkIdTypeArray(
+            np.arange(0, 3 * len(hc) + 1, 3, dtype=np.int64), deep=True),
+            numpy_to_vtkIdTypeArray(hc.ravel(), deep=True))
+        heads_poly.SetPolys(hcells)
+        heads = vtk.vtkActor()
+        hm = vtk.vtkPolyDataMapper()
+        hm.SetInputData(heads_poly)
+        heads.SetMapper(hm)
+        heads.GetProperty().SetColor(1.0, 1.0, 1.0)
+        heads.GetProperty().LightingOff()
+        heads.GetProperty().SetOpacity(0.95)
+
         fill._swatch_preset = _SWATCH_FLIP_NAME
-        lines._swatch_preset = _SWATCH_FLIP_NAME
-        return [fill, lines]
+        ring_actor._swatch_preset = _SWATCH_FLIP_NAME
+        shaft._swatch_preset = _SWATCH_FLIP_NAME
+        heads._swatch_preset = _SWATCH_FLIP_NAME
+        return [fill, ring_actor, shaft, heads]
+
+    @staticmethod
+    def _make_textured_swatch_texture() -> "vtk.vtkTexture":
+        """Icon look for the 'textured' ball: a subtle gray checkerboard.
+
+        Always shown on the swatch itself (the real albedo appears on the
+        model when the textured preset is active), with slight contrast so
+        the PBR lighting still reads.
+        """
+        n = 256                       # texture edge (power of two)
+        cells = 8                     # checker squares per edge
+        yy, xx = np.mgrid[0:n, 0:n]
+        checker = (((xx * cells) // n) + ((yy * cells) // n)) % 2
+        base = np.where(checker == 0, 0.50, 0.61)
+        rgb = (np.stack([base] * 3, axis=-1) * 255.0).astype(np.uint8)
+        # VTK texture images have their origin bottom-left, hence the flip
+        arr = np.flipud(rgb)
+
+        img = vtk.vtkImageData()
+        img.SetDimensions(n, n, 1)
+        # flattened (n*n, 3) so numpy_support sees 2-D and keeps RGB
+        # components
+        img.GetPointData().SetScalars(numpy_to_vtk(
+            arr.reshape(-1, 3), deep=True))
+        tex = vtk.vtkTexture()
+        tex.SetInputData(img)
+        tex.InterpolateOn()
+        tex.SetUseSRGBColorSpace(True)   # PBR expects sRGB albedo
+        return tex
 
     def _update_swatch_texture(self):
         """Snapshot the primary model and refresh the 'textured' ball."""
@@ -1568,28 +1683,18 @@ class ModelViewer(QVTKRenderWindowInteractor):
             self._snapshot_originals()
         self._refresh_textured_swatch()
     def _refresh_textured_swatch(self):
-        """Put the textured variant's albedo on the 'textured' ball.
+        """Keep the checkerboard icon on the 'textured' ball.
 
-        Falls back to the primary model's albedo for a fully textured mesh
-        loaded directly (no separate variant).
+        The ball always wears the checkerboard pattern (it marks the
+        texture slot); the model's actual albedo shows up in the viewport
+        when the textured preset is selected, not on the swatch.
         """
         actor = self._swatch_actors["textured"]
-        albedo = next(
-            (entry["textures"].get("albedoTex")
-             for entry in (*self._texture_originals, *self._originals)
-             if entry["textures"].get("albedoTex") is not None),
-            None,
-        )
         prop = actor.GetProperty()
-        if albedo is not None:
-            if hasattr(prop, "RemoveTexture"):
-                prop.RemoveTexture("albedoTex")
-            prop.SetTexture("albedoTex", albedo)
-            prop.SetColor(1.0, 1.0, 1.0)
-        else:
-            if hasattr(prop, "RemoveTexture"):
-                prop.RemoveTexture("albedoTex")
-            prop.SetColor(0.55, 0.55, 0.55)
+        if hasattr(prop, "RemoveTexture"):
+            prop.RemoveTexture("albedoTex")   # replaces without a VTK warning
+        prop.SetTexture("albedoTex", self._textured_swatch_fallback)
+        prop.SetColor(1.0, 1.0, 1.0)   # texture carries the color
     def _swatch_at(self, qt_x: int, qt_y: int) -> str | None:
         """Preset name of the swatch under the cursor, if any.
 

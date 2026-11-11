@@ -243,14 +243,28 @@ class MeshDeformer:
         verts = candidates[inside]
         if len(verts) == 0:
             return 0
-        falloff = (1.0 - dist[inside] / mesh_radius) ** 2
+        vdist = dist[inside]
+        falloff = (1.0 - vdist / mesh_radius) ** 2
+        # UV-seam weld: pull every coincident copy of the touched vertices
+        # into the dab. Copies share positions, so each inherits its
+        # in-brush twin's distance/falloff unchanged; skipping this would
+        # leave one shell's copy outside the brush while the other moves.
+        inv = topo["weld_inverse"]
+        if len(inv) == polydata.GetNumberOfPoints():
+            ug, first = np.unique(inv[verts], return_index=True)
+            members = np.where(np.isin(inv, ug))[0]
+            if len(members) > len(verts):
+                row = np.searchsorted(ug, inv[members])
+                verts = members
+                vdist = vdist[first][row]
+                falloff = falloff[first][row]
         # the flatten pass keeps this clean quadratic: the inner-core boost
         # below is folded into *falloff* only (smoothing digs harder in the
         # middle, but flattening stays purely radial so the pressed plane
         # stays an even terrace instead of a dimple)
         flatten_falloff = falloff
         if inner_ratio > 0.0 and inner_boost != 1.0:
-            core = dist[inside] <= inner_ratio * mesh_radius
+            core = vdist <= inner_ratio * mesh_radius
             falloff = np.where(core, falloff * inner_boost, falloff)
 
         self._capture_before(polydata, verts)
@@ -283,7 +297,7 @@ class MeshDeformer:
                 # at the centre to zero at the rim) layered on the quadratic
                 # falloff, so the flatten blends into the untouched surface
                 # with no visible terrace at the brush border
-                t = np.clip(dist[inside] / mesh_radius, 0.0, 1.0)
+                t = np.clip(vdist / mesh_radius, 0.0, 1.0)
                 fade = 1.0 - t * t * t * (t * (t * 6.0 - 15.0) + 10.0)
                 weight = np.minimum(
                     np.clip(flatten, 0.0, 1.0) * flatten_falloff * fade,
@@ -302,6 +316,13 @@ class MeshDeformer:
             mult = self.symmetry.fade_mult(
                 points[verts] @ full.T + trans, radius_world)
             points[verts] = pre + disp * mult
+        # keep coincident copies glued: each chart copy's one-ring differs
+        # across a UV seam, so the per-vertex Laplacian would drift them
+        # apart and tear the shells into visible holes. Replace every
+        # touched vertex with its position-group's post-pass mean. (On a
+        # welded mesh every group is a single vertex -- a no-op.)
+        if len(inv) == polydata.GetNumberOfPoints():
+            self._weld_average(topo, points, verts)
         data = polydata.GetPoints().GetData()
         data.Modified()
         polydata.GetPoints().Modified()
@@ -349,6 +370,27 @@ class MeshDeformer:
         points[verts] = (points[verts]
                          + (averages - points[verts]) * weight[:, None])
         return len(verts)
+
+    @staticmethod
+    def _weld_average(topo, points, verts):
+        """Move each touched vertex to its position-group's mean.
+
+        All group members entered the dab with identical positions and
+        identical falloff, so on a welded mesh (single-member groups) the
+        mean is the vertex's own position -- a no-op. On a UV-seam split
+        mesh the copies' one-rings differ across the seam; the group mean
+        makes every copy end up at the same spot, so the shells stay
+        closed while both sides still get smoothed."""
+        inv = topo["weld_inverse"]
+        g = inv[verts]
+        order = np.argsort(g, kind="stable")
+        vs = verts[order]
+        gs = g[order]
+        _uniq, starts = np.unique(gs, return_index=True)
+        counts = np.diff(np.append(starts, len(gs)))
+        means = (np.add.reduceat(points[vs], starts, axis=0)
+                 / counts[:, None])
+        points[vs] = np.repeat(means, counts, axis=0)
 
     # -- masking --------------------------------------------------------------
     def vertex_mask_for_cells(self, actor, included) -> np.ndarray | None:
@@ -493,6 +535,22 @@ class MeshDeformer:
         topo = {"conn": conn, "offs": offs, "sizes": sizes,
                 "indptr": indptr, "indices": dst,
                 "vcell_ptr": vcell_ptr, "vcell_ids": vcell_ids}
+
+        # position-weld groups: the UV unwrap (xatlas) duplicates vertices
+        # along every seam, and the chart copies do NOT share faces -- so
+        # their one-rings differ and per-vertex smoothing drifts them
+        # apart (visible holes between the shells). Coincident vertices
+        # are grouped once here; every dab moves groups as a unit.
+        pts = np.asarray(vtk_to_numpy(polydata.GetPoints().GetData()),
+                         dtype=np.float64)
+        if len(pts):
+            diag = float(np.linalg.norm(pts.max(0) - pts.min(0)))
+            eps = max(diag * 1e-6, 1e-9)
+            keys = np.round(pts / eps).astype(np.int64)
+            _ug, inverse = np.unique(keys, axis=0, return_inverse=True)
+            topo["weld_inverse"] = inverse.astype(np.int64)
+        else:
+            topo["weld_inverse"] = np.zeros(0, dtype=np.int64)
         self._topology[key] = (polydata, topo)
         return topo
 

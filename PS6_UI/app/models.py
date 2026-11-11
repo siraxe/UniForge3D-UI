@@ -75,6 +75,23 @@ class ModelLibrary(QObject):
         self.stage1_images = None
         self.changed.emit()
 
+    def reset(self):
+        """Start clean (File > New): drop the displayed model, the ghost
+        overlay, any pending edit and every tracked path.  Files on disk
+        are never touched; only the in-UI project state is cleared."""
+        self.edits.discard("new project")
+        self.viewer.remove_ghost()
+        self.viewer.clear()
+        self.folder = None
+        self.last_output = None
+        self.texture_state = None
+        self.texture_source = None
+        self.stage1_state = None
+        self.stage1_source = None
+        self.stage1_images = None
+        self.changed.emit()
+        self.log.emit("New project: workspace cleared.", "ok")
+
     def adopt(self, path: Path):
         """Bookkeeping for a model the viewer just displayed."""
         path = Path(path)
@@ -406,8 +423,24 @@ class ModelLibrary(QObject):
         self.changed.emit()
 
     def open_output_folder(self):
-        """Open the folder holding the last generated model."""
-        target = (self.last_output.parent if self.last_output
+        """Reveal the displayed model's .obj companion in Explorer.
+
+        Like the Outliner's Show obj action, the .obj matching the
+        currently displayed mesh is selected.  Without an .obj companion
+        the displayed file itself is selected; with nothing loaded the
+        folder holding the last generated model (or the default output
+        directory) is opened."""
+        current = self.viewer.current_path
+        if current is not None and os.name == "nt":
+            target = self.obj_path(current) or Path(current)
+            try:
+                subprocess.Popen(
+                    f'explorer /select,"{os.path.normpath(str(target))}"')
+                return
+            except OSError as ex:
+                self.log.emit(f"Could not open Explorer: {ex}", "error")
+                return
+        folder = (self.last_output.parent if self.last_output
                   else OUTPUT_DIR)
-        if target.is_dir():
-            os.startfile(str(target))
+        if folder.is_dir():
+            os.startfile(str(folder))

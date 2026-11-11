@@ -8,7 +8,7 @@ from PySide6.QtWidgets import QApplication, QDialog, QMessageBox
 import viewer as viewer_mod
 from dialogs import SplitNameDialog
 from paths import _edit_output_path, _paths_equal
-from utils.mesh import as_triangles
+from utils.mesh import as_triangles, welded_smooth_normals
 
 class EditSession(QObject):
     """Owns the unsaved edit stack and writes it when the user saves."""
@@ -104,6 +104,8 @@ class EditSession(QObject):
         if previous is not None:
             previous.pop("vertices", None)
             previous.pop("faces", None)
+            # brush strokes moved the surface: stored normals are stale
+            previous.pop("normals", None)
         self._smooth_dirty = True
         self.changed.emit()
         if not same or not self._smooth_bake_logged:
@@ -293,6 +295,51 @@ class EditSession(QObject):
         self.jobs.close_holes.start(loaded, vertices=vertices, faces=faces)
         self.changed.emit()
 
+    def run_smooth_normals(self):
+        """Maya-style smooth ALL vertex normals of the displayed mesh.
+
+        A shading-only edit: vertices/faces are untouched. The welded
+        smooth normals ride along in the pending edit (chaining onto any
+        unsaved edit like the other operations), drive the display, and
+        are written as the GLB NORMAL attribute on Save/Bake."""
+        loaded = self._target("Smooth normals")
+        if loaded is None:
+            return
+        vertices, faces = self.arrays_for(loaded)
+        if vertices is None:
+            import trimesh
+
+            try:
+                mesh = trimesh.load(str(loaded), force="mesh", process=False)
+                if not isinstance(mesh, trimesh.Trimesh):
+                    raise ValueError(
+                        f"{loaded.name} did not load as one triangle mesh")
+                vertices, faces = mesh.vertices, mesh.faces
+            except Exception as ex:  # noqa: BLE001 - report in the UI
+                self.log.emit(f"Smooth normals: could not read {loaded.name}"
+                              f" ({ex}).", "error")
+                return
+        else:
+            self.log.emit("Smooth normals: using the current unsaved "
+                          "in-memory edit as input; earlier changes are "
+                          "kept.", "info")
+        import numpy as np
+
+        vertices, faces = as_triangles(np.asarray(vertices),
+                                       np.asarray(faces))
+        result = {
+            "target_path": str(loaded),
+            "vertices": vertices,
+            "faces": faces,
+            "normals": welded_smooth_normals(vertices, faces),
+            "mode_label": "Smooth normals",
+        }
+        if self.accept_result("Smooth normals", result):
+            self.viewer.smooth_model_normals()
+            self.log.emit("Smooth normals applied (shading only, geometry "
+                          "unchanged). Save/Bake writes the NORMAL "
+                          "attribute.", "ok")
+
     def run_delete_hidden(self):
         loaded = self._target("Delete hidden")
         if loaded is None:
@@ -434,6 +481,16 @@ class EditSession(QObject):
                            or [previous.get("mode_label", "Edit")])
         history.append(label)
         result["history"] = history
+        # keep the shading smooth across the edit stack: every result gets
+        # Maya-style welded normals (averaged per unique position, across
+        # UV seams too) unless the operation supplies its own. Without
+        # this, topology edits like Unwrap UVs (which duplicates vertices
+        # along the seams) reset the shading to hard/faceted -- both in
+        # the viewer and in the saved file (Save/Bake writes the welded
+        # normals as the GLB NORMAL attribute).
+        if result.get("normals") is None:
+            result["normals"] = welded_smooth_normals(
+                result["vertices"], result["faces"])
         self.pending = result
         self._smooth_dirty = False
         self.changed.emit()
@@ -516,6 +573,7 @@ class EditSession(QObject):
             stats = load_tool("reproject").save_reprojected(
                 source, output, vertices, faces,
                 uvs=edit.get("uvs"),
+                normals=edit.get("normals"),
                 log=lambda message, level="info":
                     self.log.emit(message, level))
         except Exception as ex:  # noqa: BLE001 - report in the UI
@@ -535,6 +593,10 @@ class EditSession(QObject):
                               "warn")
         if self.viewer.load(output, preserve_camera=True,
                             preserve_material=True):
+            if edit.get("normals") is not None:
+                # keep the smooth shading visible (the written NORMAL
+                # attribute may or may not be honoured by the importer)
+                self.viewer.smooth_model_normals()
             self.saved.emit(output, True)
             self.log.emit(
                 f"{'Baked changes into' if replace else 'Saved and showing'} "

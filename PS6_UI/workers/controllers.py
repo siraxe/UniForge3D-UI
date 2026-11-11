@@ -807,7 +807,10 @@ class ObjConverter(QObject):
 
     def _job(self, glb: Path):
         try:
+            import numpy as np
             import trimesh
+
+            from utils.mesh import welded_smooth_normals
 
             stem = glb.stem
             obj = glb.with_suffix(".obj")
@@ -824,6 +827,7 @@ class ObjConverter(QObject):
             loaded = trimesh.load(str(glb))
             geometries = (loaded.geometry.values()
                           if hasattr(loaded, "geometry") else [loaded])
+            geometries = list(geometries)
             for geom in geometries:
                 material = getattr(getattr(geom, "visual", None),
                                    "material", None)
@@ -831,8 +835,24 @@ class ObjConverter(QObject):
                     # trimesh derives the exported texture file name from the
                     # material name; match it to the OBJ stem.
                     material.name = stem
+            if len(geometries) == 1 and isinstance(
+                    geometries[0], trimesh.Trimesh):
+                # Export the Trimesh directly. Going through the Scene
+                # export path dumps (copies) every geometry, and Trimesh
+                # .copy() drops the normals cache -- trimesh then recomputed
+                # normals on the seam-split topology, so every UV shell
+                # shaded independently and the model looked like it was
+                # made from chunks. Keep the file's stored (welded)
+                # normals; when the GLB has none, compute Maya-style welded
+                # ones so UV seams never show as shading breaks.
+                mesh = geometries[0]
+                if "vertex_normals" not in mesh._cache.cache:
+                    mesh.vertex_normals = welded_smooth_normals(
+                        np.asarray(mesh.vertices), np.asarray(mesh.faces))
+                loaded = mesh
             loaded.export(str(glb.with_suffix(".obj")),
-                          include_texture=True, mtl_name=f"{stem}.mtl")
+                          include_texture=True, mtl_name=f"{stem}.mtl",
+                          include_normals=True)
             sidecars = sorted(p.name for p in glb.parent.iterdir()
                               if p.name not in before
                               and p.suffix.lower() != ".obj")
@@ -895,6 +915,7 @@ class UltraTexController(QObject):
               bake_size: int = 4096, use_pbr: bool = True,
               use_refine: bool = True, use_second_rig: bool = True,
               use_distill_lora: bool = True, render_mesh: Path | None = None,
+              ws_normal_map: Path | None = None,
               reference_views: dict | None = None):
         cmd = {
             "cmd": "texture",
@@ -913,6 +934,8 @@ class UltraTexController(QObject):
             cmd["mask"] = str(mask)
         if render_mesh is not None:
             cmd["render_mesh"] = str(render_mesh)
+        if ws_normal_map is not None:
+            cmd["ws_normal_map"] = str(ws_normal_map)
         if reference_views:
             cmd["reference_views"] = {view: str(path) for view, path
                                       in reference_views.items()}

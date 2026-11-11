@@ -217,6 +217,14 @@ class MainWindow(QMainWindow):
     # -- UI construction ------------------------------------------------
     def _build_menu(self):
         m = self.menuBar().addMenu("&File")
+        act_new = QAction("&New", self)
+        act_new.setShortcut(hotkeys.seq("new_project"))
+        act_new.setToolTip(
+            "Clear the workspace: model, ghost, pending edit and input "
+            "images (files on disk are kept)")
+        act_new.triggered.connect(self.on_new_project)
+        m.addAction(act_new)
+        m.addSeparator()
         act_open = QAction("Open &folder...", self)
         act_open.setShortcut(hotkeys.seq("open_folder"))
         act_open.triggered.connect(self.on_open_folder)
@@ -398,6 +406,21 @@ class MainWindow(QMainWindow):
     def on_clear_images(self):
         if self.jobs.cancel_after_rmbg():
             self.log("Pending generation cancelled (images cleared).", "warn")
+        self.app_state.clear()
+
+    def on_new_project(self):
+        """File > New: clean the UI of the current project.
+
+        Drops the displayed model, ghost overlay, pending edit, tracked
+        outputs and input images.  Nothing on disk is deleted."""
+        if self.jobs.busy:
+            QMessageBox.information(
+                self, "New project",
+                "Wait for the current background job to finish first.")
+            return
+        if self.jobs.cancel_after_rmbg():
+            self.log("Pending generation cancelled (new project).", "warn")
+        self.models.reset()
         self.app_state.clear()
 
     def on_open_folder(self):

@@ -562,7 +562,7 @@ class Pipeline(QObject):
             "geometry only) ...", "info")
 
     def run_ultratex(self, *, output_mode, render_size, bake_size, steps,
-                     seed, refine, second_rig):
+                     seed, refine, second_rig, ws_low=False):
         """Texture the displayed mesh with UltraTex (FLUX.2 Klein 9B).
 
         The in-app sampling worker lands in milestone M2/M3 (see
@@ -587,6 +587,19 @@ class Pipeline(QObject):
                 "displayed mesh.")
             self.changed.emit()
             return
+        # "Use on low": condition the views on the prebaked WS normal map
+        # (high-poly normals over the low-poly silhouette) when it exists;
+        # the engine then ignores the circle-marked donor.
+        ws_map = None
+        if ws_low:
+            cand = loaded.with_name(loaded.stem + "_wsnormal.png")
+            if cand.is_file():
+                ws_map = cand
+            else:
+                self.log.emit(
+                    "Use on low: no <mesh>_wsnormal.png next to the "
+                    "displayed mesh -- run Bake WS Normal first. Rendering "
+                    "plain world normals.", "warn")
         pending = self.window.edits.pending
         has_uvs = bool(pending and pending.get("uvs") is not None)
         if not has_uvs and _mesh_file_has_uvs(loaded):
@@ -659,11 +672,12 @@ class Pipeline(QObject):
             steps=int(steps), render_size=int(render_size),
             bake_size=int(bake_size), use_pbr=pbr, use_refine=bool(refine),
             use_second_rig=bool(second_rig), render_mesh=render_mesh,
-            reference_views=view_refs or None)
+            ws_normal_map=ws_map, reference_views=view_refs or None)
         self.log.emit(
             f"UltraTex: texturing {loaded.name} | reference {image.name}"
             + (f" | views: {', '.join(sorted(view_refs))}"
                if view_refs else "")
+            + (" | WS normal map on" if ws_map is not None else "")
             + f" | render {render_size}px, bake {bake_size}px, steps {steps}, "
             f"seed {seed_text}, refine {'on' if refine else 'off'}, second "
             f"rig {'on' if second_rig else 'off'}, PBR {'on' if pbr else 'off'}",

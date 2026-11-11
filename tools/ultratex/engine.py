@@ -315,6 +315,67 @@ def render_views(verts, faces, uvs, vnorms, cameras, size,
     return torch.stack(imgs), torch.stack(masks)
 
 
+def load_ws_normal_map(path):
+    """Load a saved WS normal atlas (``<mesh>_wsnormal.png``) as an
+    [H,W,3] float 0..1 tensor in comfy's in-memory texel mapping.
+
+    ``save_atlas`` flipped rows on save (glTF/OBJ convention); the render
+    sampler works against trimesh UVs and the unflipped atlas, so the
+    rows are flipped back here."""
+    from PIL import Image
+    img = np.asarray(Image.open(str(path)).convert("RGB"))
+    img = np.ascontiguousarray(img[::-1]).astype(np.float32) / 255.0
+    return torch.from_numpy(img)
+
+
+def render_ws_normal_views(verts, faces, uvs, ws_tex, cameras, size):
+    """'world normal' conditioning renders driven by a prebaked world-space
+    normal map ("Use on low"): each pixel samples ``ws_tex`` [H,W,3] at the
+    hit texel's UV, decodes n*2-1, and re-encodes it in the same canonical
+    basis mode='world normal' uses -- so the diffusion model sees the baked
+    high-poly normals over the low-poly silhouette. Returns the same
+    (images [V,H,W,3], masks [V,H,W]) layout as ``render_views``."""
+    dev = verts.device
+    tri = verts[faces]
+    bvh = _mp._build_triangle_bvh(tri)
+    # Canonical basis, identical to render_views(mode="world normal")
+    fwd, right = _mp._mesh_view_camera(cameras[0], dev)[1:3]
+    y = fwd.new_tensor([0.0, 1.0, 0.0])
+    x = torch.cross(fwd, y, dim=-1)
+    x = (torch.nn.functional.normalize(x, dim=-1, eps=1e-6)
+         if float(x.norm()) > 1e-6 else right)
+    basis = torch.stack([x, y, torch.cross(x, y, dim=-1)])
+    bg = torch.full((3,), 0x28 / 255.0, device=dev)
+    ws = ws_tex.to(dev).float()
+    H = W = int(size)
+    chunk = 1 << 22
+    imgs, masks = [], []
+    for cam_info in cameras:
+        eye, fwd, right, up, fov_rad, ortho_half = \
+            _mp._mesh_view_camera(cam_info, dev)
+        o, d = _mp._view_rays(eye, fwd, right, up, fov_rad, H, W, ortho_half)
+        img = torch.zeros((H * W, 3), device=dev)
+        hit_all = torch.zeros(H * W, dtype=torch.bool, device=dev)
+        for s in range(0, H * W, chunk):
+            e = min(s + chunk, H * W)
+            t_hit, face, hit = _mp._closest_hit_rays_bvh(
+                o[s:e], d[s:e], tri, bvh, tmin=1e-5, tmax=1e30)
+            if bool(hit.any()):
+                fh = face[hit].clamp_min(0)
+                P = o[s:e][hit] + t_hit[hit, None] * d[s:e][hit]
+                bary = _mp._barycentric(P, tri[fh])
+                uvh = (bary[:, :, None] * uvs[faces[fh]]).sum(1)
+                n = _mp._sample_image01(ws, uvh) * 2.0 - 1.0
+                n = torch.nn.functional.normalize(n, dim=-1, eps=1e-6)
+                img[s:e][hit] = (n @ basis.T * 0.5 + 0.5).clamp(0.0, 1.0)
+            hit_all[s:e] = hit
+        imgs.append(torch.where(
+            hit_all.reshape(H, W)[..., None],
+            img.reshape(H, W, 3).clamp(0.0, 1.0), bg))
+        masks.append(hit_all.reshape(H, W).to(torch.float32))
+    return torch.stack(imgs), torch.stack(masks)
+
+
 def build_conditioning(conditioning, vae, normals, masks, reference,
                        reference_mask=None, extra_views=None):
     """UltraTexConditioning port: optional reference mask plus per-view
@@ -648,12 +709,21 @@ def run(job: UltraTexJob, log=None, cancel=None) -> UltraTexJob:
 
     tick("Loading mesh + reference")
     v, f, uvs, vnorms = load_mesh_arrays(job.mesh_path)
+    # "Use on low": a prebaked WS normal map exists -- the conditioning
+    # renders show the baked high-poly normals on the displayed low-poly
+    # mesh (its own UVs steer the sampling); a circle-marked donor is
+    # ignored in this mode. Geometry/UVs of the bake target stay untouched,
+    # so the atlases keep mapping onto the low-poly layout.
+    ws_tex = None
+    if job.ws_normal_map and Path(job.ws_normal_map).is_file():
+        ws_tex = load_ws_normal_map(job.ws_normal_map)
     # Conditioning-render geometry: the circle-marked ghost mesh when set
     # (screenshots only, no UVs needed); the textured mesh otherwise. The
     # textured mesh stays the bake/projection target (its UVs + geometry
     # produce the atlases and the display GLB).
     vr, fr, vnr = v, f, vnorms
-    if job.render_mesh_path and str(job.render_mesh_path) != str(job.mesh_path):
+    if ws_tex is None and job.render_mesh_path and \
+            str(job.render_mesh_path) != str(job.mesh_path):
         vr, fr, _ru, vnr = load_mesh_arrays(job.render_mesh_path,
                                             require_uvs=False)
         log(f"Normal renders use the circle-marked mesh "
@@ -668,6 +738,11 @@ def run(job: UltraTexJob, log=None, cancel=None) -> UltraTexJob:
               else np.asarray(uvs))
     vnorms = vnorms.to(dev)
     vr, fr, vnr = vr.to(dev), fr.to(dev), vnr.to(dev)
+    if ws_tex is not None:
+        ws_tex = ws_tex.to(dev)
+        log(f"WS normal map on: normal renders use "
+            f"{Path(job.ws_normal_map).name} on the displayed mesh.",
+            "info")
     ref, ref_mask = load_reference(job.reference_image, job.reference_mask)
     ref = ref.to(dev)
     if ref_mask is not None:
@@ -749,11 +824,22 @@ def run(job: UltraTexJob, log=None, cancel=None) -> UltraTexJob:
     # they are cached across runs (seed/steps/reference changes reuse them;
     # a render-size or geometry change re-renders).
     normals_key = normal_views_cache_key(vr, fr, vnr, size)
+    if ws_tex is not None:
+        # the WS map changes the pixels without changing the geometry --
+        # fold its identity into the cache key so a stale smooth-normal
+        # cache is never reused
+        import hashlib
+        st = os.stat(job.ws_normal_map)
+        normals_key += "-ws" + hashlib.sha256(
+            f"{Path(job.ws_normal_map).resolve()}"
+            f"|{st.st_mtime_ns}|{st.st_size}".encode()).hexdigest()[:8]
     tick(f"Rendering rig-1 world normals ({size}x{size}, 6 views)")
     normals1, masks1 = cached_or_render_normals(
         views_dir, "rig1", normals_key, cameras1, size, vr, fr, vnr,
-        lambda: render_views(vr, fr, None, vnr, cameras1, size,
-                             mode="world normal"),
+        lambda: (render_ws_normal_views(v, f, uvs_d, ws_tex, cameras1, size)
+                 if ws_tex is not None else
+                 render_views(vr, fr, None, vnr, cameras1, size,
+                              mode="world normal")),
         log)
     tick("Building UltraTex conditioning")
     cond = build_conditioning(models.conditioning, models.vae, normals1,
@@ -790,8 +876,11 @@ def run(job: UltraTexJob, log=None, cancel=None) -> UltraTexJob:
         tick(f"Rendering rig-2 world normals ({len(cameras2)} views)")
         normals2, masks2 = cached_or_render_normals(
             views_dir, "rig2", normals_key, cameras2, size, vr, fr, vnr,
-            lambda: render_views(vr, fr, None, vnr, cameras2, size,
-                                 mode="world normal"),
+            lambda: (render_ws_normal_views(v, f, uvs_d, ws_tex,
+                                            cameras2, size)
+                     if ws_tex is not None else
+                     render_views(vr, fr, None, vnr, cameras2, size,
+                                  mode="world normal")),
             log)
         cond2 = build_conditioning(models.conditioning, models.vae,
                                    normals2, masks2, ref, ref_mask,

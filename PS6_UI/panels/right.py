@@ -245,6 +245,17 @@ class RightPanel(QWidget):
             "right-drag zooms while placing points.")
         self.btn_resym.clicked.connect(self._start_resym)
         sym_row.addWidget(self.btn_resym)
+
+        self.btn_smooth_normals = QPushButton("Smooth normals")
+        self.btn_smooth_normals.setFixedHeight(24)
+        self.btn_smooth_normals.setToolTip(
+            "Maya-style smooth every vertex normal of the displayed mesh "
+            "(averaged per unique position, across UV seams too, "
+            "corner-angle weighted). Shading only -- geometry is untouched; "
+            "the smooth normals stay in the unsaved edit and are written "
+            "as NORMAL on Save / Bake changes.")
+        self.btn_smooth_normals.clicked.connect(self._smooth_normals)
+        sym_row.addWidget(self.btn_smooth_normals)
         layout.addLayout(sym_row)
 
         self.sym_x = QCheckBox("X")
@@ -503,7 +514,7 @@ class RightPanel(QWidget):
         layout.addWidget(self.utex_hint)
 
         self.btn_bake_ws = QPushButton("Bake WS Normal")
-        self.btn_bake_ws.setFixedHeight(28)
+        self.btn_bake_ws.setFixedHeight(22)
         self.btn_bake_ws.setToolTip(
             "World-space normal atlas: the displayed mesh is the low-poly "
             "target (its smoothed normals steer the projection, Maya-style); "
@@ -511,7 +522,17 @@ class RightPanel(QWidget):
             "<mesh>_wsnormal.png next to the displayed mesh. Requires UVs "
             "on the displayed mesh.")
         self.btn_bake_ws.clicked.connect(self._bake_ws_normal)
-        layout.addWidget(self.btn_bake_ws)
+
+        self.ws_low = QCheckBox("Use on low")
+        self.ws_low.setChecked(False)
+        self.ws_low.setToolTip(
+            "Use the low-poly displayed mesh as the bake source")
+
+        ws_row = QHBoxLayout()
+        ws_row.setSpacing(6)
+        ws_row.addWidget(self.btn_bake_ws, 1)
+        ws_row.addWidget(self.ws_low)
+        layout.addLayout(ws_row)
 
         self.btn_ultratex = QPushButton("Run UltraTex")
         self.btn_ultratex.setFixedHeight(28)
@@ -521,13 +542,14 @@ class RightPanel(QWidget):
         layout.addWidget(self.btn_ultratex)
 
         # Swap-in Stop button while the UltraTex worker subprocess runs.
-        self.btn_utex_stop = QPushButton("Stop UltraTex")
+        self.btn_utex_stop = QPushButton("Stop")
         self.btn_utex_stop.setFixedHeight(28)
         self.btn_utex_stop.setStyleSheet(
             "QPushButton { background-color: #a04040; color: white; "
             "font-weight: 600; }")
         self.btn_utex_stop.setToolTip(
-            "Kill the UltraTex worker subprocess (nothing is written)")
+            "Kill the UltraTex / Bake WS Normal worker subprocess "
+            "(nothing is written)")
         self.btn_utex_stop.clicked.connect(lambda: self.win.pipeline.stop())
         self.btn_utex_stop.setVisible(False)
         layout.addWidget(self.btn_utex_stop)
@@ -737,7 +759,8 @@ class RightPanel(QWidget):
             seed=None if self.utex_seed_random.isChecked()
             else self.utex_seed.value(),
             refine=self.utex_refine.isChecked(),
-            second_rig=self.utex_second_rig.isChecked())
+            second_rig=self.utex_second_rig.isChecked(),
+            ws_low=self.ws_low.isChecked())
 
     def _run_subdivide(self):
         self.win.edits.run_subdivide()
@@ -757,6 +780,9 @@ class RightPanel(QWidget):
 
     def _start_resym(self):
         self.win.viewer.resym.start()
+
+    def _smooth_normals(self):
+        self.win.edits.run_smooth_normals()
 
     def _save_edit(self):
         self.win.edits.save(replace=False)

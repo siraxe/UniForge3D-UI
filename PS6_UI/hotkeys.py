@@ -23,6 +23,9 @@ class Hotkey:
 #: :func:`seq`; never hard-code a key string anywhere else.
 HOTKEYS: dict[str, Hotkey] = {
     # File / app (menu bar in main.py)
+    "new_project": Hotkey(
+        "Ctrl+N", "Clear the workspace: displayed model, ghost overlay, "
+        "pending edit and input images (files on disk are kept)."),
     "open_folder": Hotkey(
         "Ctrl+O", "Pick a folder; every *.glb (and any *.obj without a "
         "GLB twin) appears in the Outliner column."),
